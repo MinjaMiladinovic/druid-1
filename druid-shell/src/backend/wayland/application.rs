@@ -12,555 +12,694 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(clippy::single_match)]
+//! Management of multiple windows.
 
-use super::{
-    clipboard, display, error::Error, events::WaylandSource, keyboard, outputs, pointers, surfaces,
-    window::WindowHandle,
+use std::collections::{HashMap, VecDeque};
+use std::mem;
+use tracing::{error, info, info_span};
+
+// Automatically defaults to std::time::Instant on non Wasm platforms
+use instant::Instant;
+
+use crate::piet::{Color, Piet, RenderContext};
+use crate::shell::{text::InputHandler, Counter, Cursor, Region, TextFieldToken, WindowHandle};
+
+use crate::app::{PendingWindow, WindowSizePolicy};
+use crate::contexts::ContextState;
+use crate::core::{CommandQueue, FocusChange, WidgetState};
+use crate::debug_state::DebugState;
+use crate::menu::{MenuItemId, MenuManager};
+use crate::text::TextFieldRegistration;
+use crate::widget::LabelText;
+use crate::win_handler::RUN_COMMANDS_TOKEN;
+use crate::{
+    BoxConstraints, Data, Env, Event, EventCtx, ExtEventSink, Handled, InternalEvent,
+    InternalLifeCycle, LayoutCtx, LifeCycle, LifeCycleCtx, Menu, PaintCtx, Point, Size, TimerToken,
+    UpdateCtx, Widget, WidgetId, WidgetPod,
 };
 
-use crate::{backend, mouse, AppHandler, TimerToken};
+pub type ImeUpdateFn = dyn FnOnce(crate::shell::text::Event);
 
-use calloop;
+/// A unique identifier for a window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct WindowId(u64);
 
-use std::{
-    cell::{Cell, RefCell},
-    collections::{BTreeMap, BinaryHeap},
-    rc::Rc,
-    time::{Duration, Instant},
-};
-
-use crate::backend::shared::linux;
-use wayland_client::protocol::wl_keyboard::WlKeyboard;
-use wayland_client::protocol::wl_registry;
-use wayland_client::{
-    self as wl,
-    protocol::{
-        wl_compositor::WlCompositor,
-        wl_pointer::WlPointer,
-        wl_seat::{self, WlSeat},
-        wl_shm::{self, WlShm},
-        wl_surface::WlSurface,
-    },
-};
-use wayland_cursor::CursorTheme;
-use wayland_protocols::unstable::xdg_decoration::v1::client::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1;
-use wayland_protocols::wlr::unstable::layer_shell::v1::client::zwlr_layer_shell_v1::ZwlrLayerShellV1;
-use wayland_protocols::xdg_shell::client::xdg_positioner::XdgPositioner;
-use wayland_protocols::xdg_shell::client::xdg_surface;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Timer(backend::shared::Timer<u64>);
-
-impl Timer {
-    pub(crate) fn new(id: u64, deadline: Instant) -> Self {
-        Self(backend::shared::Timer::new(deadline, id))
-    }
-
-    pub(crate) fn id(self) -> u64 {
-        self.0.data
-    }
-
-    pub(crate) fn deadline(&self) -> Instant {
-        self.0.deadline()
-    }
-
-    pub fn token(&self) -> TimerToken {
-        self.0.token()
-    }
+/// Per-window state not owned by user code.
+pub struct Window<T> {
+    pub(crate) id: WindowId,
+    pub(crate) root: WidgetPod<T, Box<dyn Widget<T>>>,
+    pub(crate) title: LabelText<T>,
+    size_policy: WindowSizePolicy,
+    size: Size,
+    invalid: Region,
+    pub(crate) menu: Option<MenuManager<T>>,
+    pub(crate) context_menu: Option<(MenuManager<T>, Point)>,
+    // This will be `Some` whenever the most recently displayed frame was an animation frame.
+    pub(crate) last_anim: Option<Instant>,
+    pub(crate) last_mouse_pos: Option<Point>,
+    pub(crate) focus: Option<WidgetId>,
+    pub(crate) handle: WindowHandle,
+    pub(crate) timers: HashMap<TimerToken, WidgetId>,
+    pub(crate) pending_text_registrations: Vec<TextFieldRegistration>,
+    pub(crate) transparent: bool,
+    pub(crate) ime_handlers: Vec<(TextFieldToken, TextFieldRegistration)>,
+    ext_handle: ExtEventSink,
+    pub(crate) ime_focus_change: Option<Option<TextFieldToken>>,
 }
 
-impl std::cmp::Ord for Timer {
-    /// Ordering is so that earliest deadline sorts first
-    // "Earliest deadline first" that a std::collections::BinaryHeap will have the earliest timer
-    // at its head, which is just what is needed for timer management.
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.deadline().cmp(&other.0.deadline()).reverse()
-    }
-}
-
-impl std::cmp::PartialOrd for Timer {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-#[derive(Clone)]
-pub struct Application {
-    pub(super) data: std::sync::Arc<Data>,
-}
-
-#[allow(dead_code)]
-pub(crate) struct Data {
-    pub(super) wayland: std::rc::Rc<display::Environment>,
-    pub(super) zxdg_decoration_manager_v1: wl::Main<ZxdgDecorationManagerV1>,
-    pub(super) zwlr_layershell_v1: wl::Main<ZwlrLayerShellV1>,
-    pub(super) wl_compositor: wl::Main<WlCompositor>,
-    pub(super) wl_shm: wl::Main<WlShm>,
-    /// A map of wayland object IDs to outputs.
-    ///
-    /// Wayland will update this if the output change. Keep a record of the `Instant` you last
-    /// observed a change, and use `Output::changed` to see if there are any newer changes.
-    ///
-    /// It's a BTreeMap so the ordering is consistent when enumerating outputs (not sure if this is
-    /// necessary, but it negligable cost).
-    pub(super) outputs: Rc<RefCell<BTreeMap<u32, outputs::Meta>>>,
-    pub(super) seats: Rc<RefCell<BTreeMap<u32, Rc<RefCell<Seat>>>>>,
-
-    /// Handles to any surfaces that have been created.
-    pub(super) handles: RefCell<im::OrdMap<u64, WindowHandle>>,
-
-    /// Available pixel formats
-    pub(super) formats: RefCell<Vec<wl_shm::Format>>,
-    /// Close flag
-    pub(super) shutdown: Cell<bool>,
-    /// The currently active surface, if any (by wayland object ID)
-    pub(super) active_surface_id: RefCell<std::collections::VecDeque<u64>>,
-    // Stuff for timers
-    /// A calloop event source for timers. We always set it to fire at the next set timer, if any.
-    pub(super) timer_handle: calloop::timer::TimerHandle<TimerToken>,
-    /// We stuff this here until the event loop, then `take` it and use it.
-    timer_source: RefCell<Option<calloop::timer::Timer<TimerToken>>>,
-    /// Currently pending timers
-    ///
-    /// The extra data is the surface this timer is for.
-    pub(super) timers: RefCell<BinaryHeap<Timer>>,
-
-    pub(super) roundtrip_requested: RefCell<bool>,
-
-    /// track if the display was flushed during the event loop.
-    /// prevents double flushing unnecessarily.
-    pub(super) display_flushed: RefCell<bool>,
-    /// reference to the pointer events manager.
-    pub(super) pointer: pointers::Pointer,
-    /// reference to the keyboard events manager.
-    keyboard: keyboard::Manager,
-    clipboard: clipboard::Manager,
-    // wakeup events when outputs are added/removed.
-    outputsqueue: RefCell<Option<calloop::channel::Channel<outputs::Event>>>,
-}
-
-impl Application {
-    pub fn new() -> Result<Self, Error> {
-        tracing::info!("wayland application initiated");
-
-        // Global objects that can come and go (so we must handle them dynamically).
-        //
-        // They have to be behind a shared pointer because wayland may need to add or remove them
-        // for the life of the application. Use weak rcs inside the callbacks to avoid leaking
-        // memory.
-        let dispatcher = display::Dispatcher::default();
-        let outputqueue = outputs::auto(&dispatcher)?;
-
-        let seats: Rc<RefCell<BTreeMap<u32, Rc<RefCell<Seat>>>>> =
-            Rc::new(RefCell::new(BTreeMap::new()));
-        // This object will create a container for the global wayland objects, and request that
-        // it is populated by the server. Doesn't take ownership of the registry, we are
-        // responsible for keeping it alive.
-        let weak_seats = Rc::downgrade(&seats);
-
-        display::GlobalEventDispatch::subscribe(
-            &dispatcher,
-            move |event: &'_ wl::GlobalEvent,
-                  registry: &'_ wl::Attached<wl_registry::WlRegistry>,
-                  _ctx: &'_ wl::DispatchData| {
-                match event {
-                    wl::GlobalEvent::New {
-                        id,
-                        interface,
-                        version,
-                    } => {
-                        let id = *id;
-                        let version = *version;
-
-                        if !(interface.as_str() == "wl_seat" && version >= 7) {
-                            return;
-                        }
-                        tracing::debug!("seat detected {:?} {:?} {:?}", interface, id, version);
-                        let new_seat = registry.bind::<WlSeat>(7, id);
-                        let prev_seat = weak_seats
-                            .upgrade()
-                            .unwrap()
-                            .borrow_mut()
-                            .insert(id, Rc::new(RefCell::new(Seat::new(new_seat))));
-                        assert!(
-                            prev_seat.is_none(),
-                            "internal: wayland should always use new IDs"
-                        );
-                        // Defer setting up the pointer/keyboard event handling until we've
-                        // finished constructing the `Application`. That way we can pass it as a
-                        // parameter.
-                    }
-                    wl::GlobalEvent::Removed { .. } => {
-                        // nothing to do.
-                    }
-                };
-            },
-        );
-
-        let env = display::new(dispatcher)?;
-        display::print(&env.registry);
-
-        let zxdg_decoration_manager_v1 = env
-            .registry
-            .instantiate_exact::<ZxdgDecorationManagerV1>(1)
-            .map_err(|e| Error::global("zxdg_decoration_manager_v1", 1, e))?;
-        let zwlr_layershell_v1 = env
-            .registry
-            .instantiate_exact::<ZwlrLayerShellV1>(1)
-            .map_err(|e| Error::global("zwlr_layershell_v1", 1, e))?;
-        let wl_compositor = env
-            .registry
-            .instantiate_exact::<WlCompositor>(4)
-            .map_err(|e| Error::global("wl_compositor", 4, e))?;
-        let wl_shm = env
-            .registry
-            .instantiate_exact::<WlShm>(1)
-            .map_err(|e| Error::global("wl_shm", 1, e))?;
-
-        let timer_source = calloop::timer::Timer::new().unwrap();
-        let timer_handle = timer_source.handle();
-
-        // TODO the cursor theme size needs more refinement, it should probably be the size needed to
-        // draw sharp cursors on the largest scaled monitor.
-        let pointer = pointers::Pointer::new(
-            CursorTheme::load(64, &wl_shm),
-            wl_compositor.create_surface(),
-        );
-
-        // We need to have keyboard events set up for our seats before the next roundtrip.
-        let appdata = std::sync::Arc::new(Data {
-            zxdg_decoration_manager_v1,
-            zwlr_layershell_v1,
-            wl_compositor,
-            wl_shm: wl_shm.clone(),
-            outputs: Rc::new(RefCell::new(BTreeMap::new())),
-            seats,
-            handles: RefCell::new(im::OrdMap::new()),
-            formats: RefCell::new(vec![]),
-            shutdown: Cell::new(false),
-            active_surface_id: RefCell::new(std::collections::VecDeque::with_capacity(20)),
-            timer_handle,
-            timer_source: RefCell::new(Some(timer_source)),
-            timers: RefCell::new(BinaryHeap::new()),
-            display_flushed: RefCell::new(false),
-            pointer,
-            keyboard: keyboard::Manager::default(),
-            clipboard: clipboard::Manager::new(&env.display, &env.registry)?,
-            roundtrip_requested: RefCell::new(false),
-            outputsqueue: RefCell::new(Some(outputqueue)),
-            wayland: std::rc::Rc::new(env),
-        });
-
-        for m in outputs::current()? {
-            appdata.outputs.borrow_mut().insert(m.id(), m);
+impl<T> Window<T> {
+    pub(crate) fn new(
+        id: WindowId,
+        handle: WindowHandle,
+        pending: PendingWindow<T>,
+        ext_handle: ExtEventSink,
+    ) -> Window<T> {
+        Window {
+            id,
+            root: WidgetPod::new(pending.root),
+            size_policy: pending.size_policy,
+            size: Size::ZERO,
+            invalid: Region::EMPTY,
+            title: pending.title,
+            transparent: pending.transparent,
+            menu: pending.menu,
+            context_menu: None,
+            last_anim: None,
+            last_mouse_pos: None,
+            focus: None,
+            handle,
+            timers: HashMap::new(),
+            ext_handle,
+            ime_handlers: Vec::new(),
+            ime_focus_change: None,
+            pending_text_registrations: Vec::new(),
         }
+    }
+}
 
-        // Collect the supported image formats.
-        wl_shm.quick_assign(with_cloned!(appdata; move |d1, event, d3| {
-            tracing::debug!("shared memory events {:?} {:?} {:?}", d1, event, d3);
-            match event {
-                wl_shm::Event::Format { format } => appdata.formats.borrow_mut().push(format),
-                _ => (), // ignore other messages
-            }
-        }));
+impl<T: Data> Window<T> {
+    /// `true` iff any child requested an animation frame since the last `AnimFrame` event.
+    pub(crate) fn wants_animation_frame(&self) -> bool {
+        self.root.state().request_anim
+    }
 
-        // Setup seat event listeners with our application
-        for (id, seat) in appdata.seats.borrow().iter() {
-            let id = *id; // move into closure.
-            let wl_seat = seat.borrow().wl_seat.clone();
-            wl_seat.quick_assign(with_cloned!(seat, appdata; move |d1, event, d3| {
-                tracing::debug!("seat events {:?} {:?} {:?}", d1, event, d3);
-                let mut seat = seat.borrow_mut();
-                appdata.clipboard.attach(&mut seat);
-                match event {
-                    wl_seat::Event::Capabilities { capabilities } => {
-                        seat.capabilities = capabilities;
-                        if capabilities.contains(wl_seat::Capability::Keyboard)
-                            && seat.keyboard.is_none()
-                        {
-                            seat.keyboard = Some(appdata.keyboard.attach(id, seat.wl_seat.clone()));
-                        }
-                        if capabilities.contains(wl_seat::Capability::Pointer)
-                            && seat.pointer.is_none()
-                        {
-                            let pointer = seat.wl_seat.get_pointer();
-                            appdata.pointer.attach(pointer.detach());
-                            pointer.quick_assign({
-                                let app = appdata.clone();
-                                move |pointer, event, _| {
-                                    pointers::Pointer::consume(app.clone(), pointer.detach(), event);
-                                }
-                            });
-                            seat.pointer = Some(pointer);
-                        }
-                        // Dont worry if they go away - we will just stop receiving events. If the
-                        // capability comes back we will start getting events again.
-                    }
-                    wl_seat::Event::Name { name } => {
-                        seat.name = name;
-                    }
-                    _ => tracing::info!("seat quick assign unknown event {:?}", event), // ignore future events
+    pub(crate) fn focus_chain(&self) -> &[WidgetId] {
+        &self.root.state().focus_chain
+    }
+
+    /// Returns `true` if the provided widget may be in this window,
+    /// but it may also be a false positive.
+    /// However when this returns `false` the widget is definitely not in this window.
+    pub(crate) fn may_contain_widget(&self, widget_id: WidgetId) -> bool {
+        // The bloom filter we're checking can return false positives.
+        widget_id == self.root.id() || self.root.state().children.may_contain(&widget_id)
+    }
+
+    pub(crate) fn menu_cmd(
+        &mut self,
+        queue: &mut CommandQueue,
+        cmd_id: MenuItemId,
+        data: &mut T,
+        env: &Env,
+    ) {
+        if let Some(menu) = &mut self.menu {
+            menu.event(queue, Some(self.id), cmd_id, data, env);
+        }
+        if let Some((menu, _)) = &mut self.context_menu {
+            menu.event(queue, Some(self.id), cmd_id, data, env);
+        }
+    }
+
+    pub(crate) fn show_context_menu(&mut self, menu: Menu<T>, point: Point, data: &T, env: &Env) {
+        let mut manager = MenuManager::new_for_popup(menu);
+        self.handle
+            .show_context_menu(manager.initialize(Some(self.id), data, env), point);
+        self.context_menu = Some((manager, point));
+    }
+
+    /// On macos we need to update the global application menu to be the menu
+    /// for the current window.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn macos_update_app_menu(&mut self, data: &T, env: &Env) {
+        if let Some(menu) = self.menu.as_mut() {
+            self.handle.set_menu(menu.refresh(data, env));
+        }
+    }
+
+    fn post_event_processing(
+        &mut self,
+        widget_state: &mut WidgetState,
+        queue: &mut CommandQueue,
+        data: &T,
+        env: &Env,
+        process_commands: bool,
+    ) {
+        // If children are changed during the handling of an event,
+        // we need to send RouteWidgetAdded now, so that they are ready for update/layout.
+        if widget_state.children_changed {
+            // Anytime widgets are removed we check and see if any of those
+            // widgets had IME sessions and unregister them if so.
+            let Window {
+                ime_handlers,
+                handle,
+                ..
+            } = self;
+            ime_handlers.retain(|(token, v)| {
+                let will_retain = v.is_alive();
+                if !will_retain {
+                    tracing::debug!("{:?} removed", token);
+                    handle.remove_text_field(*token);
                 }
-            }));
+                will_retain
+            });
+
+            self.lifecycle(
+                queue,
+                &LifeCycle::Internal(InternalLifeCycle::RouteWidgetAdded),
+                data,
+                env,
+                false,
+            );
         }
 
-        // Let wayland finish setup before we allow the client to start creating windows etc.
-        appdata.sync()?;
+        if self.root.state().needs_window_origin && !self.root.state().needs_layout {
+            let event = LifeCycle::Internal(InternalLifeCycle::ParentWindowOrigin);
+            self.lifecycle(queue, &event, data, env, false);
+        }
 
-        Ok(Application { data: appdata })
-    }
+        // Update the disabled state if necessary
+        // Always do this before updating the focus-chain
+        if self.root.state().tree_disabled_changed() {
+            let event = LifeCycle::Internal(InternalLifeCycle::RouteDisabledChanged);
+            self.lifecycle(queue, &event, data, env, false);
+        }
 
-    pub fn run(mut self, _handler: Option<Box<dyn AppHandler>>) {
-        tracing::info!("wayland event loop initiated");
-        // NOTE if we want to call this function more than once, we will need to put the timer
-        // source back.
-        let timer_source = self.data.timer_source.borrow_mut().take().unwrap();
-        // flush pending events (otherwise anything we submitted since sync will never be sent)
-        self.data.wayland.display.flush().unwrap();
+        // Update the focus-chain if necessary
+        // Always do this before sending focus change, since this event updates the focus chain.
+        if self.root.state().update_focus_chain {
+            let event = LifeCycle::BuildFocusChain;
+            self.lifecycle(queue, &event, data, env, false);
+        }
 
-        // Use calloop so we can epoll both wayland events and others (e.g. timers)
-        let mut eventloop = calloop::EventLoop::try_new().unwrap();
-        let handle = eventloop.handle();
+        self.update_focus(widget_state, queue, data, env);
 
-        let wayland_dispatcher = WaylandSource::new(self.data.clone()).into_dispatcher();
+        // If we need a new paint pass, make sure druid-shell knows it.
+        if self.wants_animation_frame() {
+            self.handle.request_anim_frame();
+        }
+        self.invalid.union_with(&widget_state.invalid);
+        for ime_field in self.pending_text_registrations.drain(..) {
+            let token = self.handle.add_text_field();
+            tracing::debug!("{:?} added", token);
+            self.ime_handlers.push((token, ime_field));
+        }
 
-        self.data.keyboard.events(&handle);
-
-        handle.register_dispatcher(wayland_dispatcher).unwrap();
-        handle
-            .insert_source(self.data.outputsqueue.take().unwrap(), {
-                move |evt, _ignored, appdata| match evt {
-                    calloop::channel::Event::Closed => {}
-                    calloop::channel::Event::Msg(output) => match output {
-                        outputs::Event::Located(output) => {
-                            appdata
-                                .outputs
-                                .borrow_mut()
-                                .insert(output.id(), output.clone());
-                            for (_, win) in appdata.handles_iter() {
-                                surfaces::Outputs::inserted(&win, &output);
-                            }
-                        }
-                        outputs::Event::Removed(output) => {
-                            appdata.outputs.borrow_mut().remove(&output.id());
-                            for (_, win) in appdata.handles_iter() {
-                                surfaces::Outputs::removed(&win, &output);
-                            }
-                        }
-                    },
-                }
-            })
-            .unwrap();
-
-        handle
-            .insert_source(timer_source, move |token, _metadata, appdata| {
-                tracing::trace!("timer source {:?}", token);
-                appdata.handle_timer_event(token);
-            })
-            .unwrap();
-
-        let signal = eventloop.get_signal();
-        let handle = handle.clone();
-
-        let res = eventloop.run(Duration::from_millis(20), &mut self.data, move |appdata| {
-            if appdata.shutdown.get() {
-                tracing::debug!("shutting down, requested");
-                signal.stop();
-                return;
+        // If there are any commands and they should be processed
+        if process_commands && !queue.is_empty() {
+            // Ask the handler to call us back on idle
+            // so we can process them in a new event/update pass.
+            if let Some(mut handle) = self.handle.get_idle_handle() {
+                handle.schedule_idle(RUN_COMMANDS_TOKEN);
+            } else {
+                error!("failed to get idle handle");
             }
+        }
+    }
 
-            if appdata.handles.borrow().len() == 0 {
-                tracing::debug!("shutting down, no window remaining");
-                signal.stop();
-                return;
+    pub(crate) fn event(
+        &mut self,
+        queue: &mut CommandQueue,
+        event: Event,
+        data: &mut T,
+        env: &Env,
+    ) -> Handled {
+        match &event {
+            Event::WindowSize(size) => self.size = *size,
+            Event::MouseDown(e) | Event::MouseUp(e) | Event::MouseMove(e) | Event::Wheel(e) => {
+                self.last_mouse_pos = Some(e.pos)
             }
-
-            Data::idle_repaint(handle.clone());
-        });
-
-        match res {
-            Ok(_) => tracing::info!("wayland event loop completed"),
-            Err(cause) => tracing::error!("wayland event loop failed {:?}", cause),
+            Event::Internal(InternalEvent::MouseLeave) => self.last_mouse_pos = None,
+            _ => (),
         }
-    }
 
-    pub fn quit(&self) {
-        self.data.shutdown.set(true);
-    }
-
-    pub fn clipboard(&self) -> clipboard::Clipboard {
-        clipboard::Clipboard::from(&self.data.clipboard)
-    }
-
-    pub fn get_locale() -> String {
-        linux::env::locale()
-    }
-}
-
-impl surfaces::Compositor for Data {
-    fn output(&self, id: u32) -> Option<outputs::Meta> {
-        self.outputs.borrow().get(&id).cloned()
-    }
-
-    fn create_surface(&self) -> wl::Main<WlSurface> {
-        self.wl_compositor.create_surface()
-    }
-
-    fn shared_mem(&self) -> wl::Main<WlShm> {
-        self.wl_shm.clone()
-    }
-
-    fn get_xdg_positioner(&self) -> wl::Main<XdgPositioner> {
-        self.wayland.xdg_base.create_positioner()
-    }
-
-    fn get_xdg_surface(&self, s: &wl::Main<WlSurface>) -> wl::Main<xdg_surface::XdgSurface> {
-        self.wayland.xdg_base.get_xdg_surface(s)
-    }
-
-    fn zxdg_decoration_manager_v1(&self) -> wl::Main<ZxdgDecorationManagerV1> {
-        self.zxdg_decoration_manager_v1.clone()
-    }
-
-    fn zwlr_layershell_v1(&self) -> wl::Main<ZwlrLayerShellV1> {
-        self.zwlr_layershell_v1.clone()
-    }
-}
-
-impl Data {
-    pub(crate) fn set_cursor(&self, cursor: &mouse::Cursor) {
-        self.pointer.replace(cursor);
-    }
-
-    /// Send all pending messages and process all received messages.
-    ///
-    /// Don't use this once the event loop has started.
-    pub(crate) fn sync(&self) -> Result<(), Error> {
-        self.wayland
-            .queue
-            .borrow_mut()
-            .sync_roundtrip(&mut (), |evt, _, _| {
-                panic!("unexpected wayland event: {:?}", evt)
-            })
-            .map_err(Error::fatal)?;
-        Ok(())
-    }
-
-    fn current_window_id(&self) -> u64 {
-        static DEFAULT: u64 = 0_u64;
-        *self.active_surface_id.borrow().get(0).unwrap_or(&DEFAULT)
-    }
-
-    pub(super) fn acquire_current_window(&self) -> Option<WindowHandle> {
-        self.handles
-            .borrow()
-            .get(&self.current_window_id())
-            .cloned()
-    }
-
-    fn handle_timer_event(&self, _token: TimerToken) {
-        // Don't borrow the timers in case the callbacks want to add more.
-        let mut expired_timers = Vec::with_capacity(1);
-        let mut timers = self.timers.borrow_mut();
-        let now = Instant::now();
-        while matches!(timers.peek(), Some(timer) if timer.deadline() < now) {
-            // timer has passed
-            expired_timers.push(timers.pop().unwrap());
-        }
-        drop(timers);
-        for expired in expired_timers {
-            let win = match self.handles.borrow().get(&expired.id()).cloned() {
-                Some(s) => s,
-                None => {
-                    // NOTE this might be expected
-                    tracing::warn!(
-                        "received event for surface that doesn't exist any more {:?} {:?}",
-                        expired,
-                        expired.id()
-                    );
-                    continue;
+        let event = match event {
+            Event::Timer(token) => {
+                if let Some(widget_id) = self.timers.remove(&token) {
+                    Event::Internal(InternalEvent::RouteTimer(token, widget_id))
+                } else {
+                    error!("No widget found for timer {:?}", token);
+                    return Handled::No;
                 }
+            }
+            other => other,
+        };
+
+        if let Event::WindowConnected = event {
+            self.lifecycle(
+                queue,
+                &LifeCycle::Internal(InternalLifeCycle::RouteWidgetAdded),
+                data,
+                env,
+                false,
+            );
+        }
+
+        let mut widget_state = WidgetState::new(self.root.id(), Some(self.size));
+        let is_handled = {
+            let mut state = ContextState::new::<T>(
+                queue,
+                &self.ext_handle,
+                &self.handle,
+                self.id,
+                self.focus,
+                &mut self.timers,
+                &mut self.pending_text_registrations,
+            );
+            let mut notifications = VecDeque::new();
+            let mut ctx = EventCtx {
+                state: &mut state,
+                notifications: &mut notifications,
+                widget_state: &mut widget_state,
+                is_handled: false,
+                is_root: true,
             };
-            // re-entrancy
-            if let Some(data) = win.data() {
-                data.handler.borrow_mut().timer(expired.token())
+
+            {
+                let _span = info_span!("event");
+                let _span = _span.enter();
+                self.root.event(&mut ctx, &event, data, env);
             }
-        }
 
-        for (_, win) in self.handles_iter() {
-            if let Some(data) = win.data() {
-                data.run_deferred_tasks()
-            }
-        }
-
-        // Get the deadline soonest and queue it.
-        if let Some(timer) = self.timers.borrow().peek() {
-            self.timer_handle
-                .add_timeout(timer.deadline() - now, timer.token());
-        }
-        // Now flush so the events actually get sent (we don't do this automatically because we
-        // aren't in a wayland callback.
-        self.wayland.display.flush().unwrap();
-    }
-
-    /// Shallow clones surfaces so we can modify it during iteration.
-    pub(super) fn handles_iter(&self) -> impl Iterator<Item = (u64, WindowHandle)> {
-        self.handles.borrow().clone().into_iter()
-    }
-
-    fn idle_repaint(loophandle: calloop::LoopHandle<'_, std::sync::Arc<Data>>) {
-        loophandle.insert_idle({
-            move |appdata| {
-                tracing::trace!("idle processing initiated");
-                for (_id, winhandle) in appdata.handles_iter() {
-                    winhandle.request_anim_frame();
-                    winhandle.run_idle();
-                    // if we already flushed this cycle don't flush again.
-                    if *appdata.display_flushed.borrow() {
-                        tracing::trace!("idle repaint flushing display initiated");
-                        if let Err(cause) = appdata.wayland.queue.borrow().display().flush() {
-                            tracing::warn!("unable to flush display: {:?}", cause);
-                        }
-                    }
+            if !ctx.notifications.is_empty() {
+                info!("{} unhandled notifications:", ctx.notifications.len());
+                for (i, n) in ctx.notifications.iter().enumerate() {
+                    info!("{}: {:?}", i, n);
                 }
-                tracing::trace!("idle processing completed");
             }
-        });
-    }
-}
+            Handled::from(ctx.is_handled)
+        };
 
-impl From<Application> for surfaces::CompositorHandle {
-    fn from(app: Application) -> surfaces::CompositorHandle {
-        surfaces::CompositorHandle::from(app.data)
-    }
-}
-
-impl From<std::sync::Arc<Data>> for surfaces::CompositorHandle {
-    fn from(data: std::sync::Arc<Data>) -> surfaces::CompositorHandle {
-        surfaces::CompositorHandle::direct(
-            std::sync::Arc::downgrade(&data) as std::sync::Weak<dyn surfaces::Compositor>
-        )
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct Seat {
-    pub(super) wl_seat: wl::Main<WlSeat>,
-    name: String,
-    capabilities: wl_seat::Capability,
-    keyboard: Option<wl::Main<WlKeyboard>>,
-    pointer: Option<wl::Main<WlPointer>>,
-}
-
-impl Seat {
-    fn new(wl_seat: wl::Main<WlSeat>) -> Self {
-        Self {
-            wl_seat,
-            name: "".into(),
-            capabilities: wl_seat::Capability::empty(),
-            keyboard: None,
-            pointer: None,
+        if let Some(cursor) = &widget_state.cursor {
+            self.handle.set_cursor(cursor);
+        } else if matches!(
+            event,
+            Event::MouseMove(..) | Event::Internal(InternalEvent::MouseLeave)
+        ) {
+            self.handle.set_cursor(&Cursor::Arrow);
         }
+
+        if matches!(
+            (event, self.size_policy),
+            (Event::WindowSize(_), WindowSizePolicy::Content)
+        ) {
+            // Because our initial size can be zero, the window system won't ask us to paint.
+            // So layout ourselves and hopefully we resize
+            self.layout(queue, data, env);
+        }
+
+        self.post_event_processing(&mut widget_state, queue, data, env, false);
+
+        is_handled
+    }
+
+    pub(crate) fn lifecycle(
+        &mut self,
+        queue: &mut CommandQueue,
+        event: &LifeCycle,
+        data: &T,
+        env: &Env,
+        process_commands: bool,
+    ) {
+        let mut widget_state = WidgetState::new(self.root.id(), Some(self.size));
+        let mut state = ContextState::new::<T>(
+            queue,
+            &self.ext_handle,
+            &self.handle,
+            self.id,
+            self.focus,
+            &mut self.timers,
+            &mut self.pending_text_registrations,
+        );
+        let mut ctx = LifeCycleCtx {
+            state: &mut state,
+            widget_state: &mut widget_state,
+        };
+
+        {
+            let _span = info_span!("lifecycle");
+            let _span = _span.enter();
+            self.root.lifecycle(&mut ctx, event, data, env);
+        }
+
+        self.post_event_processing(&mut widget_state, queue, data, env, process_commands);
+    }
+
+    pub(crate) fn update(&mut self, queue: &mut CommandQueue, data: &T, env: &Env) {
+        self.update_title(data, env);
+
+        let mut widget_state = WidgetState::new(self.root.id(), Some(self.size));
+        let mut state = ContextState::new::<T>(
+            queue,
+            &self.ext_handle,
+            &self.handle,
+            self.id,
+            self.focus,
+            &mut self.timers,
+            &mut self.pending_text_registrations,
+        );
+        let mut update_ctx = UpdateCtx {
+            widget_state: &mut widget_state,
+            state: &mut state,
+            prev_env: None,
+            env,
+        };
+
+        {
+            let _span = info_span!("update");
+            let _span = _span.enter();
+            self.root.update(&mut update_ctx, data, env);
+        }
+
+        if let Some(cursor) = &widget_state.cursor {
+            self.handle.set_cursor(cursor);
+        }
+
+        self.post_event_processing(&mut widget_state, queue, data, env, false);
+    }
+
+    pub(crate) fn invalidate_and_finalize(&mut self) {
+        if self.root.state().needs_layout {
+            self.handle.invalidate();
+        } else {
+            for rect in self.invalid.rects() {
+                self.handle.invalidate_rect(*rect);
+            }
+        }
+        self.invalid.clear();
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn invalid(&self) -> &Region {
+        &self.invalid
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn invalid_mut(&mut self) -> &mut Region {
+        &mut self.invalid
+    }
+
+    /// Get ready for painting, by doing layout and sending an `AnimFrame` event.
+    pub(crate) fn prepare_paint(&mut self, queue: &mut CommandQueue, data: &mut T, env: &Env) {
+        let now = Instant::now();
+        // TODO: this calculation uses wall-clock time of the paint call, which
+        // potentially has jitter.
+        //
+        // See https://github.com/linebender/druid/issues/85 for discussion.
+        let last = self.last_anim.take();
+        let elapsed_ns = last.map(|t| now.duration_since(t).as_nanos()).unwrap_or(0) as u64;
+
+        if self.wants_animation_frame() {
+            self.event(queue, Event::AnimFrame(elapsed_ns), data, env);
+            self.last_anim = Some(now);
+        }
+    }
+
+    pub(crate) fn do_paint(
+        &mut self,
+        piet: &mut Piet,
+        invalid: &Region,
+        queue: &mut CommandQueue,
+        data: &T,
+        env: &Env,
+    ) {
+        if self.root.state().needs_layout {
+            self.layout(queue, data, env);
+        }
+
+        for &r in invalid.rects() {
+            piet.clear(
+                Some(r),
+                if self.transparent {
+                    Color::TRANSPARENT
+                } else {
+                    env.get(crate::theme::WINDOW_BACKGROUND_COLOR)
+                },
+            );
+        }
+        self.paint(piet, invalid, queue, data, env);
+    }
+
+    fn layout(&mut self, queue: &mut CommandQueue, data: &T, env: &Env) {
+        let mut widget_state = WidgetState::new(self.root.id(), Some(self.size));
+        let mut state = ContextState::new::<T>(
+            queue,
+            &self.ext_handle,
+            &self.handle,
+            self.id,
+            self.focus,
+            &mut self.timers,
+            &mut self.pending_text_registrations,
+        );
+        let mut layout_ctx = LayoutCtx {
+            state: &mut state,
+            widget_state: &mut widget_state,
+            mouse_pos: self.last_mouse_pos,
+        };
+        let bc = match self.size_policy {
+            WindowSizePolicy::User => BoxConstraints::tight(self.size),
+            WindowSizePolicy::Content => BoxConstraints::UNBOUNDED,
+        };
+
+        let content_size = {
+            let _span = info_span!("layout");
+            let _span = _span.enter();
+            self.root.layout(&mut layout_ctx, &bc, data, env)
+        };
+
+        if let WindowSizePolicy::Content = self.size_policy {
+            let insets = self.handle.content_insets();
+            let full_size = (content_size.to_rect() + insets).size();
+            if self.size != full_size {
+                self.size = full_size;
+                self.handle.set_size(full_size)
+            }
+        }
+        self.root
+            .set_origin(&mut layout_ctx, data, env, Point::ORIGIN);
+        self.lifecycle(
+            queue,
+            &LifeCycle::Internal(InternalLifeCycle::ParentWindowOrigin),
+            data,
+            env,
+            false,
+        );
+        self.post_event_processing(&mut widget_state, queue, data, env, true);
+    }
+
+    /// only expose `layout` for testing; normally it is called as part of `do_paint`
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn just_layout(&mut self, queue: &mut CommandQueue, data: &T, env: &Env) {
+        self.layout(queue, data, env)
+    }
+
+    fn paint(
+        &mut self,
+        piet: &mut Piet,
+        invalid: &Region,
+        queue: &mut CommandQueue,
+        data: &T,
+        env: &Env,
+    ) {
+        let widget_state = WidgetState::new(self.root.id(), Some(self.size));
+        let mut state = ContextState::new::<T>(
+            queue,
+            &self.ext_handle,
+            &self.handle,
+            self.id,
+            self.focus,
+            &mut self.timers,
+            &mut self.pending_text_registrations,
+        );
+        let mut ctx = PaintCtx {
+            render_ctx: piet,
+            state: &mut state,
+            widget_state: &widget_state,
+            z_ops: Vec::new(),
+            region: invalid.clone(),
+            depth: 0,
+        };
+
+        let root = &mut self.root;
+        info_span!("paint").in_scope(|| {
+            ctx.with_child_ctx(invalid.clone(), |ctx| root.paint_raw(ctx, data, env));
+        });
+
+        let mut z_ops = mem::take(&mut ctx.z_ops);
+        z_ops.sort_by_key(|k| k.z_index);
+
+        for z_op in z_ops.into_iter() {
+            ctx.with_child_ctx(invalid.clone(), |ctx| {
+                ctx.with_save(|ctx| {
+                    ctx.render_ctx.transform(z_op.transform);
+                    (z_op.paint_func)(ctx);
+                });
+            });
+        }
+
+        if self.wants_animation_frame() {
+            self.handle.request_anim_frame();
+        }
+    }
+
+    /// Get a best-effort representation of the entire widget tree for debug purposes.
+    pub fn root_debug_state(&self, data: &T) -> DebugState {
+        self.root.widget().debug_state(data)
+    }
+
+    pub(crate) fn update_title(&mut self, data: &T, env: &Env) {
+        if self.title.resolve(data, env) {
+            self.handle.set_title(&self.title.display_text());
+        }
+    }
+
+    pub(crate) fn update_menu(&mut self, data: &T, env: &Env) {
+        if let Some(menu) = &mut self.menu {
+            if let Some(new_menu) = menu.update(Some(self.id), data, env) {
+                self.handle.set_menu(new_menu);
+            }
+        }
+        if let Some((menu, point)) = &mut self.context_menu {
+            if let Some(new_menu) = menu.update(Some(self.id), data, env) {
+                self.handle.show_context_menu(new_menu, *point);
+            }
+        }
+    }
+
+    pub(crate) fn get_ime_handler(
+        &mut self,
+        req_token: TextFieldToken,
+        mutable: bool,
+    ) -> Box<dyn InputHandler> {
+        self.ime_handlers
+            .iter()
+            .find(|(token, _)| req_token == *token)
+            .and_then(|(_, reg)| reg.document.acquire(mutable))
+            .unwrap()
+    }
+
+    fn update_focus(
+        &mut self,
+        widget_state: &mut WidgetState,
+        queue: &mut CommandQueue,
+        data: &T,
+        env: &Env,
+    ) {
+        if let Some(focus_req) = widget_state.request_focus.take() {
+            let old = self.focus;
+            let new = self.widget_for_focus_request(focus_req);
+            // Only send RouteFocusChanged in case there's actual change
+            if old != new {
+                let event = LifeCycle::Internal(InternalLifeCycle::RouteFocusChanged { old, new });
+                self.lifecycle(queue, &event, data, env, false);
+                self.focus = new;
+                // check if the newly focused widget has an IME session, and
+                // notify the system if so.
+                //
+                // If you're here because a profiler sent you: I guess I should've
+                // used a hashmap?
+                let old_was_ime = old
+                    .map(|old| {
+                        self.ime_handlers
+                            .iter()
+                            .any(|(_, sesh)| sesh.widget_id == old)
+                    })
+                    .unwrap_or(false);
+                let maybe_active_text_field = self
+                    .ime_handlers
+                    .iter()
+                    .find(|(_, sesh)| Some(sesh.widget_id) == self.focus)
+                    .map(|(token, _)| *token);
+                // we call this on every focus change; we could call it less but does it matter?
+                self.ime_focus_change = if maybe_active_text_field.is_some() {
+                    Some(maybe_active_text_field)
+                } else if old_was_ime {
+                    Some(None)
+                } else {
+                    None
+                };
+            }
+        }
+    }
+
+    /// Create a function that can invalidate the provided widget's text state.
+    ///
+    /// This will be called from outside the main app state in order to avoid
+    /// reentrancy problems.
+    pub(crate) fn ime_invalidation_fn(&self, widget: WidgetId) -> Option<Box<ImeUpdateFn>> {
+        let token = self
+            .ime_handlers
+            .iter()
+            .find(|(_, reg)| reg.widget_id == widget)
+            .map(|(t, _)| *t)?;
+        let window_handle = self.handle.clone();
+        Some(Box::new(move |event| {
+            window_handle.update_text_field(token, event)
+        }))
+    }
+
+    /// Release a lock on an IME session, returning a `WidgetId` if the lock was mutable.
+    ///
+    /// After a mutable lock is released, the widget needs to be notified so that
+    /// it can update any internal state.
+    pub(crate) fn release_ime_lock(&mut self, req_token: TextFieldToken) -> Option<WidgetId> {
+        self.ime_handlers
+            .iter()
+            .find(|(token, _)| req_token == *token)
+            .and_then(|(_, reg)| reg.document.release().then(|| reg.widget_id))
+    }
+
+    fn widget_for_focus_request(&self, focus: FocusChange) -> Option<WidgetId> {
+        match focus {
+            FocusChange::Resign => None,
+            FocusChange::Focus(id) => Some(id),
+            FocusChange::Next => self.widget_from_focus_chain(true),
+            FocusChange::Previous => self.widget_from_focus_chain(false),
+        }
+    }
+
+    fn widget_from_focus_chain(&self, forward: bool) -> Option<WidgetId> {
+        self.focus.and_then(|focus| {
+            self.focus_chain()
+                .iter()
+                // Find where the focused widget is in the focus chain
+                .position(|id| id == &focus)
+                .map(|idx| {
+                    // Return the id that's next to it in the focus chain
+                    let len = self.focus_chain().len();
+                    let new_idx = if forward {
+                        (idx + 1) % len
+                    } else {
+                        (idx + len - 1) % len
+                    };
+                    self.focus_chain()[new_idx]
+                })
+                .or_else(|| {
+                    // If the currently focused widget isn't in the focus chain,
+                    // then we'll just return the first/last entry of the chain, if any.
+                    if forward {
+                        self.focus_chain().first().copied()
+                    } else {
+                        self.focus_chain().last().copied()
+                    }
+                })
+        })
+    }
+}
+
+impl WindowId {
+    /// Allocate a new, unique window id.
+    pub fn next() -> WindowId {
+        static WINDOW_COUNTER: Counter = Counter::new();
+        WindowId(WINDOW_COUNTER.next())
     }
 }
