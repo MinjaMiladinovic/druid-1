@@ -1,4 +1,4 @@
-// Copyright 2019 The Druid Authors.
+// Copyright 2018 The Druid Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,694 +12,693 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Management of multiple windows.
+//! A textbox widget.
 
-use std::collections::{HashMap, VecDeque};
-use std::mem;
-use tracing::{error, info, info_span};
+use std::time::Duration;
+use tracing::{instrument, trace};
 
-// Automatically defaults to std::time::Instant on non Wasm platforms
-use instant::Instant;
-
-use crate::piet::{Color, Piet, RenderContext};
-use crate::shell::{text::InputHandler, Counter, Cursor, Region, TextFieldToken, WindowHandle};
-
-use crate::app::{PendingWindow, WindowSizePolicy};
-use crate::contexts::ContextState;
-use crate::core::{CommandQueue, FocusChange, WidgetState};
 use crate::debug_state::DebugState;
-use crate::menu::{MenuItemId, MenuManager};
-use crate::text::TextFieldRegistration;
-use crate::widget::LabelText;
-use crate::win_handler::RUN_COMMANDS_TOKEN;
+use crate::kurbo::Insets;
+use crate::piet::TextLayout as _;
+use crate::text::{
+    EditableText, ImeInvalidation, Selection, TextComponent, TextLayout, TextStorage,
+};
+use crate::widget::prelude::*;
+use crate::widget::{Padding, Scroll, WidgetWrapper};
 use crate::{
-    BoxConstraints, Data, Env, Event, EventCtx, ExtEventSink, Handled, InternalEvent,
-    InternalLifeCycle, LayoutCtx, LifeCycle, LifeCycleCtx, Menu, PaintCtx, Point, Size, TimerToken,
-    UpdateCtx, Widget, WidgetId, WidgetPod,
+    theme, ArcStr, Color, Command, FontDescriptor, HotKey, KeyEvent, KeyOrValue, Point, Rect,
+    SysMods, TextAlignment, TimerToken, Vec2,
 };
 
-pub type ImeUpdateFn = dyn FnOnce(crate::shell::text::Event);
+use super::LabelText;
 
-/// A unique identifier for a window.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct WindowId(u64);
+const CURSOR_BLINK_DURATION: Duration = Duration::from_millis(500);
+const MAC_OR_LINUX_OR_OBSD: bool = cfg!(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "openbsd"
+));
 
-/// Per-window state not owned by user code.
-pub struct Window<T> {
-    pub(crate) id: WindowId,
-    pub(crate) root: WidgetPod<T, Box<dyn Widget<T>>>,
-    pub(crate) title: LabelText<T>,
-    size_policy: WindowSizePolicy,
-    size: Size,
-    invalid: Region,
-    pub(crate) menu: Option<MenuManager<T>>,
-    pub(crate) context_menu: Option<(MenuManager<T>, Point)>,
-    // This will be `Some` whenever the most recently displayed frame was an animation frame.
-    pub(crate) last_anim: Option<Instant>,
-    pub(crate) last_mouse_pos: Option<Point>,
-    pub(crate) focus: Option<WidgetId>,
-    pub(crate) handle: WindowHandle,
-    pub(crate) timers: HashMap<TimerToken, WidgetId>,
-    pub(crate) pending_text_registrations: Vec<TextFieldRegistration>,
-    pub(crate) transparent: bool,
-    pub(crate) ime_handlers: Vec<(TextFieldToken, TextFieldRegistration)>,
-    ext_handle: ExtEventSink,
-    pub(crate) ime_focus_change: Option<Option<TextFieldToken>>,
+/// When we scroll after editing or movement, we show a little extra of the document.
+const SCROLL_TO_INSETS: Insets = Insets::uniform_xy(40.0, 0.0);
+
+/// A widget that allows user text input.
+///
+/// # Editing values
+///
+/// If the text you are editing represents a value of some other type, such
+/// as a number, you should use a [`ValueTextBox`] and an appropriate
+/// [`Formatter`]. You can create a [`ValueTextBox`] by passing the appropriate
+/// [`Formatter`] to [`TextBox::with_formatter`].
+///
+/// [`Formatter`]: crate::text::format::Formatter
+/// [`ValueTextBox`]: super::ValueTextBox
+pub struct TextBox<T> {
+    placeholder_text: LabelText<T>,
+    placeholder_layout: TextLayout<ArcStr>,
+    inner: Scroll<T, Padding<T, TextComponent<T>>>,
+    scroll_to_selection_after_layout: bool,
+    multiline: bool,
+    /// true if a click event caused us to gain focus.
+    ///
+    /// On macOS, if focus happens via click then we set the selection based
+    /// on the click position; if focus happens automatically (e.g. on tab)
+    /// then we select our entire contents.
+    was_focused_from_click: bool,
+    cursor_on: bool,
+    cursor_timer: TimerToken,
+    /// if `true` (the default), this textbox will attempt to change focus on tab.
+    ///
+    /// You can override this in a controller if you want to customize tab
+    /// behaviour.
+    pub handles_tab_notifications: bool,
+    text_pos: Point,
 }
 
-impl<T> Window<T> {
-    pub(crate) fn new(
-        id: WindowId,
-        handle: WindowHandle,
-        pending: PendingWindow<T>,
-        ext_handle: ExtEventSink,
-    ) -> Window<T> {
-        Window {
-            id,
-            root: WidgetPod::new(pending.root),
-            size_policy: pending.size_policy,
-            size: Size::ZERO,
-            invalid: Region::EMPTY,
-            title: pending.title,
-            transparent: pending.transparent,
-            menu: pending.menu,
-            context_menu: None,
-            last_anim: None,
-            last_mouse_pos: None,
-            focus: None,
-            handle,
-            timers: HashMap::new(),
-            ext_handle,
-            ime_handlers: Vec::new(),
-            ime_focus_change: None,
-            pending_text_registrations: Vec::new(),
+impl<T: EditableText + TextStorage> TextBox<T> {
+    /// Create a new TextBox widget.
+    pub fn new() -> Self {
+        let placeholder_text = ArcStr::from("");
+        let mut placeholder_layout = TextLayout::new();
+        placeholder_layout.set_text_color(theme::PLACEHOLDER_COLOR);
+        placeholder_layout.set_text(placeholder_text.clone());
+
+        let mut scroll = Scroll::new(Padding::new(
+            theme::TEXTBOX_INSETS,
+            TextComponent::default(),
+        ))
+        .content_must_fill(true);
+        scroll.set_enabled_scrollbars(crate::scroll_component::ScrollbarsEnabled::None);
+        Self {
+            inner: scroll,
+            scroll_to_selection_after_layout: false,
+            placeholder_text: placeholder_text.into(),
+            placeholder_layout,
+            multiline: false,
+            was_focused_from_click: false,
+            cursor_on: false,
+            cursor_timer: TimerToken::INVALID,
+            handles_tab_notifications: true,
+            text_pos: Point::ZERO,
+        }
+    }
+
+    /// Create a new multi-line `TextBox`.
+    pub fn multiline() -> Self {
+        let mut this = TextBox::new();
+        this.inner
+            .set_enabled_scrollbars(crate::scroll_component::ScrollbarsEnabled::Both);
+        this.text_mut().borrow_mut().set_accepts_newlines(true);
+        this.inner.set_horizontal_scroll_enabled(false);
+        this.multiline = true;
+        this
+    }
+
+    /// If `true` (and this is a [`multiline`] text box) lines will be wrapped
+    /// at the maximum layout width.
+    ///
+    /// If `false`, lines will not be wrapped, and horizontal scrolling will
+    /// be enabled.
+    ///
+    /// [`multiline`]: TextBox::multiline
+    pub fn with_line_wrapping(mut self, wrap_lines: bool) -> Self {
+        self.inner.set_horizontal_scroll_enabled(!wrap_lines);
+        self
+    }
+}
+
+impl<T> TextBox<T> {
+    /// Builder-style method for setting the text size.
+    ///
+    /// The argument can be either an `f64` or a [`Key<f64>`].
+    ///
+    /// [`Key<f64>`]: ../struct.Key.html
+    pub fn with_text_size(mut self, size: impl Into<KeyOrValue<f64>>) -> Self {
+        self.set_text_size(size);
+        self
+    }
+
+    /// Builder-style method to set the [`TextAlignment`].
+    ///
+    /// This is only relevant when the `TextBox` is *not* [`multiline`],
+    /// in which case it determines how the text is positioned inside the
+    /// `TextBox` when it does not fill the available space.
+    ///
+    /// # Note:
+    ///
+    /// This does not behave exactly like [`TextAlignment`] does when used
+    /// with label; in particular this does not account for reading direction.
+    /// This means that `TextAlignment::Start` (the default) always means
+    /// *left aligned*, and `TextAlignment::End` always means *right aligned*.
+    ///
+    /// This should be considered a bug, but it will not be fixed until proper
+    /// BiDi support is implemented.
+    ///
+    /// [`TextAlignment`]: enum.TextAlignment.html
+    /// [`multiline`]: #method.multiline
+    pub fn with_text_alignment(mut self, alignment: TextAlignment) -> Self {
+        self.set_text_alignment(alignment);
+        self
+    }
+
+    /// Builder-style method for setting the font.
+    ///
+    /// The argument can be a [`FontDescriptor`] or a [`Key<FontDescriptor>`]
+    /// that refers to a font defined in the [`Env`].
+    ///
+    /// [`Env`]: ../struct.Env.html
+    /// [`FontDescriptor`]: ../struct.FontDescriptor.html
+    /// [`Key<FontDescriptor>`]: ../struct.Key.html
+    pub fn with_font(mut self, font: impl Into<KeyOrValue<FontDescriptor>>) -> Self {
+        self.set_font(font);
+        self
+    }
+
+    /// Builder-style method for setting the text color.
+    ///
+    /// The argument can be either a `Color` or a [`Key<Color>`].
+    ///
+    /// [`Key<Color>`]: ../struct.Key.html
+    pub fn with_text_color(mut self, color: impl Into<KeyOrValue<Color>>) -> Self {
+        self.set_text_color(color);
+        self
+    }
+
+    /// Set the text size.
+    ///
+    /// The argument can be either an `f64` or a [`Key<f64>`].
+    ///
+    /// [`Key<f64>`]: ../struct.Key.html
+    pub fn set_text_size(&mut self, size: impl Into<KeyOrValue<f64>>) {
+        if !self.text().can_write() {
+            tracing::warn!("set_text_size called with IME lock held.");
+            return;
+        }
+
+        let size = size.into();
+        self.text_mut()
+            .borrow_mut()
+            .layout
+            .set_text_size(size.clone());
+        self.placeholder_layout.set_text_size(size);
+    }
+
+    /// Set the font.
+    ///
+    /// The argument can be a [`FontDescriptor`] or a [`Key<FontDescriptor>`]
+    /// that refers to a font defined in the [`Env`].
+    ///
+    /// [`Env`]: ../struct.Env.html
+    /// [`FontDescriptor`]: ../struct.FontDescriptor.html
+    /// [`Key<FontDescriptor>`]: ../struct.Key.html
+    pub fn set_font(&mut self, font: impl Into<KeyOrValue<FontDescriptor>>) {
+        if !self.text().can_write() {
+            tracing::warn!("set_font called with IME lock held.");
+            return;
+        }
+        let font = font.into();
+        self.text_mut().borrow_mut().layout.set_font(font.clone());
+        self.placeholder_layout.set_font(font);
+    }
+
+    /// Set the [`TextAlignment`] for this `TextBox``.
+    ///
+    /// This is only relevant when the `TextBox` is *not* [`multiline`],
+    /// in which case it determines how the text is positioned inside the
+    /// `TextBox` when it does not fill the available space.
+    ///
+    /// # Note:
+    ///
+    /// This does not behave exactly like [`TextAlignment`] does when used
+    /// with label; in particular this does not account for reading direction.
+    /// This means that `TextAlignment::Start` (the default) always means
+    /// *left aligned*, and `TextAlignment::End` always means *right aligned*.
+    ///
+    /// This should be considered a bug, but it will not be fixed until proper
+    /// BiDi support is implemented.
+    ///
+    /// [`TextAlignment`]: enum.TextAlignment.html
+    /// [`multiline`]: #method.multiline
+    pub fn set_text_alignment(&mut self, alignment: TextAlignment) {
+        if !self.text().can_write() {
+            tracing::warn!("set_text_alignment called with IME lock held.");
+            return;
+        }
+        self.text_mut().borrow_mut().set_text_alignment(alignment);
+    }
+
+    /// Set the text color.
+    ///
+    /// The argument can be either a `Color` or a [`Key<Color>`].
+    ///
+    /// If you change this property, you are responsible for calling
+    /// [`request_layout`] to ensure the label is updated.
+    ///
+    /// [`request_layout`]: ../struct.EventCtx.html#method.request_layout
+    /// [`Key<Color>`]: ../struct.Key.html
+    pub fn set_text_color(&mut self, color: impl Into<KeyOrValue<Color>>) {
+        if !self.text().can_write() {
+            tracing::warn!("set_text_color calld with IME lock held.");
+            return;
+        }
+        self.text_mut().borrow_mut().layout.set_text_color(color);
+    }
+
+    /// The point, relative to the origin, where this text box draws its
+    /// [`TextLayout`].
+    ///
+    /// This is exposed in case the user wants to do additional drawing based
+    /// on properties of the text.
+    ///
+    /// This is not valid until `layout` has been called.
+    pub fn text_position(&self) -> Point {
+        self.text_pos
+    }
+}
+
+impl<T: Data> TextBox<T> {
+    /// Builder-style method to set the `TextBox`'s placeholder text.
+    pub fn with_placeholder(mut self, placeholder: impl Into<LabelText<T>>) -> Self {
+        self.set_placeholder(placeholder);
+        self
+    }
+
+    /// Set the `TextBox`'s placeholder text.
+    pub fn set_placeholder(&mut self, placeholder: impl Into<LabelText<T>>) {
+        self.placeholder_text = placeholder.into();
+        self.placeholder_layout
+            .set_text(self.placeholder_text.display_text());
+    }
+}
+
+impl<T> TextBox<T> {
+    /// An immutable reference to the inner [`TextComponent`].
+    ///
+    /// Using this correctly is difficult; please see the [`TextComponent`]
+    /// docs for more information.
+    pub fn text(&self) -> &TextComponent<T> {
+        self.inner.child().wrapped()
+    }
+
+    /// A mutable reference to the inner [`TextComponent`].
+    ///
+    /// Using this correctly is difficult; please see the [`TextComponent`]
+    /// docs for more information.
+    pub fn text_mut(&mut self) -> &mut TextComponent<T> {
+        self.inner.child_mut().wrapped_mut()
+    }
+
+    fn reset_cursor_blink(&mut self, token: TimerToken) {
+        self.cursor_on = true;
+        self.cursor_timer = token;
+    }
+
+    fn should_draw_cursor(&self) -> bool {
+        if cfg!(target_os = "macos") && self.text().can_read() {
+            self.cursor_on && self.text().borrow().selection().is_caret()
+        } else {
+            self.cursor_on
         }
     }
 }
 
-impl<T: Data> Window<T> {
-    /// `true` iff any child requested an animation frame since the last `AnimFrame` event.
-    pub(crate) fn wants_animation_frame(&self) -> bool {
-        self.root.state().request_anim
+impl<T: TextStorage + EditableText> TextBox<T> {
+    fn rect_for_selection_end(&self) -> Rect {
+        let text = self.text().borrow();
+        let layout = text.layout.layout().unwrap();
+
+        let hit = layout.hit_test_text_position(text.selection().active);
+        let line = layout.line_metric(hit.line).unwrap();
+        let y0 = line.y_offset;
+        let y1 = y0 + line.height;
+        let x = hit.point.x;
+
+        Rect::new(x, y0, x, y1)
     }
 
-    pub(crate) fn focus_chain(&self) -> &[WidgetId] {
-        &self.root.state().focus_chain
+    fn scroll_to_selection_end(&mut self) {
+        let rect = self.rect_for_selection_end();
+        let view_rect = self.inner.viewport_rect();
+        let is_visible =
+            view_rect.contains(rect.origin()) && view_rect.contains(Point::new(rect.x1, rect.y1));
+        if !is_visible {
+            self.inner.scroll_to(rect + SCROLL_TO_INSETS);
+        }
     }
 
-    /// Returns `true` if the provided widget may be in this window,
-    /// but it may also be a false positive.
-    /// However when this returns `false` the widget is definitely not in this window.
-    pub(crate) fn may_contain_widget(&self, widget_id: WidgetId) -> bool {
-        // The bloom filter we're checking can return false positives.
-        widget_id == self.root.id() || self.root.state().children.may_contain(&widget_id)
-    }
-
-    pub(crate) fn menu_cmd(
+    /// These commands may be supplied by menus; but if they aren't, we
+    /// inject them again, here.
+    fn fallback_do_builtin_command(
         &mut self,
-        queue: &mut CommandQueue,
-        cmd_id: MenuItemId,
-        data: &mut T,
-        env: &Env,
-    ) {
-        if let Some(menu) = &mut self.menu {
-            menu.event(queue, Some(self.id), cmd_id, data, env);
-        }
-        if let Some((menu, _)) = &mut self.context_menu {
-            menu.event(queue, Some(self.id), cmd_id, data, env);
-        }
-    }
-
-    pub(crate) fn show_context_menu(&mut self, menu: Menu<T>, point: Point, data: &T, env: &Env) {
-        let mut manager = MenuManager::new_for_popup(menu);
-        self.handle
-            .show_context_menu(manager.initialize(Some(self.id), data, env), point);
-        self.context_menu = Some((manager, point));
-    }
-
-    /// On macos we need to update the global application menu to be the menu
-    /// for the current window.
-    #[cfg(target_os = "macos")]
-    pub(crate) fn macos_update_app_menu(&mut self, data: &T, env: &Env) {
-        if let Some(menu) = self.menu.as_mut() {
-            self.handle.set_menu(menu.refresh(data, env));
+        ctx: &mut EventCtx,
+        key: &KeyEvent,
+    ) -> Option<Command> {
+        use crate::commands as sys;
+        let our_id = ctx.widget_id();
+        match key {
+            key if HotKey::new(SysMods::Cmd, "c").matches(key) => Some(sys::COPY.to(our_id)),
+            key if HotKey::new(SysMods::Cmd, "x").matches(key) => Some(sys::CUT.to(our_id)),
+            // we have to send paste to the window, in order to get it converted into the `Paste`
+            // event
+            key if HotKey::new(SysMods::Cmd, "v").matches(key) => {
+                Some(sys::PASTE.to(ctx.window_id()))
+            }
+            key if HotKey::new(SysMods::Cmd, "z").matches(key) => Some(sys::UNDO.to(our_id)),
+            key if HotKey::new(SysMods::CmdShift, "Z").matches(key) && !cfg!(windows) => {
+                Some(sys::REDO.to(our_id))
+            }
+            key if HotKey::new(SysMods::Cmd, "y").matches(key) && cfg!(windows) => {
+                Some(sys::REDO.to(our_id))
+            }
+            key if HotKey::new(SysMods::Cmd, "a").matches(key) => Some(sys::SELECT_ALL.to(our_id)),
+            _ => None,
         }
     }
+}
 
-    fn post_event_processing(
-        &mut self,
-        widget_state: &mut WidgetState,
-        queue: &mut CommandQueue,
-        data: &T,
-        env: &Env,
-        process_commands: bool,
-    ) {
-        // If children are changed during the handling of an event,
-        // we need to send RouteWidgetAdded now, so that they are ready for update/layout.
-        if widget_state.children_changed {
-            // Anytime widgets are removed we check and see if any of those
-            // widgets had IME sessions and unregister them if so.
-            let Window {
-                ime_handlers,
-                handle,
-                ..
-            } = self;
-            ime_handlers.retain(|(token, v)| {
-                let will_retain = v.is_alive();
-                if !will_retain {
-                    tracing::debug!("{:?} removed", token);
-                    handle.remove_text_field(*token);
+impl<T: TextStorage + EditableText> Widget<T> for TextBox<T> {
+    #[instrument(name = "TextBox", level = "trace", skip(self, ctx, event, data, env))]
+    fn event(&mut self, ctx: &mut EventCtx, event: &Event, data: &mut T, env: &Env) {
+        match event {
+            Event::Notification(cmd) => match cmd {
+                cmd if cmd.is(TextComponent::SCROLL_TO) => {
+                    let after_edit = *cmd.get(TextComponent::SCROLL_TO).unwrap_or(&false);
+                    if after_edit {
+                        ctx.request_layout();
+                        self.scroll_to_selection_after_layout = true;
+                    } else {
+                        self.scroll_to_selection_end();
+                    }
+                    ctx.set_handled();
+                    ctx.request_paint();
                 }
-                will_retain
-            });
-
-            self.lifecycle(
-                queue,
-                &LifeCycle::Internal(InternalLifeCycle::RouteWidgetAdded),
-                data,
-                env,
-                false,
-            );
-        }
-
-        if self.root.state().needs_window_origin && !self.root.state().needs_layout {
-            let event = LifeCycle::Internal(InternalLifeCycle::ParentWindowOrigin);
-            self.lifecycle(queue, &event, data, env, false);
-        }
-
-        // Update the disabled state if necessary
-        // Always do this before updating the focus-chain
-        if self.root.state().tree_disabled_changed() {
-            let event = LifeCycle::Internal(InternalLifeCycle::RouteDisabledChanged);
-            self.lifecycle(queue, &event, data, env, false);
-        }
-
-        // Update the focus-chain if necessary
-        // Always do this before sending focus change, since this event updates the focus chain.
-        if self.root.state().update_focus_chain {
-            let event = LifeCycle::BuildFocusChain;
-            self.lifecycle(queue, &event, data, env, false);
-        }
-
-        self.update_focus(widget_state, queue, data, env);
-
-        // If we need a new paint pass, make sure druid-shell knows it.
-        if self.wants_animation_frame() {
-            self.handle.request_anim_frame();
-        }
-        self.invalid.union_with(&widget_state.invalid);
-        for ime_field in self.pending_text_registrations.drain(..) {
-            let token = self.handle.add_text_field();
-            tracing::debug!("{:?} added", token);
-            self.ime_handlers.push((token, ime_field));
-        }
-
-        // If there are any commands and they should be processed
-        if process_commands && !queue.is_empty() {
-            // Ask the handler to call us back on idle
-            // so we can process them in a new event/update pass.
-            if let Some(mut handle) = self.handle.get_idle_handle() {
-                handle.schedule_idle(RUN_COMMANDS_TOKEN);
-            } else {
-                error!("failed to get idle handle");
+                cmd if cmd.is(TextComponent::TAB) && self.handles_tab_notifications => {
+                    ctx.focus_next();
+                    ctx.request_paint();
+                    ctx.set_handled();
+                }
+                cmd if cmd.is(TextComponent::BACKTAB) && self.handles_tab_notifications => {
+                    ctx.focus_prev();
+                    ctx.request_paint();
+                    ctx.set_handled();
+                }
+                cmd if cmd.is(TextComponent::CANCEL) => {
+                    ctx.resign_focus();
+                    ctx.request_paint();
+                    ctx.set_handled();
+                }
+                _ => (),
+            },
+            Event::KeyDown(key) if !self.text().is_composing() => {
+                if let Some(cmd) = self.fallback_do_builtin_command(ctx, key) {
+                    ctx.submit_command(cmd);
+                    ctx.set_handled();
+                }
             }
-        }
-    }
-
-    pub(crate) fn event(
-        &mut self,
-        queue: &mut CommandQueue,
-        event: Event,
-        data: &mut T,
-        env: &Env,
-    ) -> Handled {
-        match &event {
-            Event::WindowSize(size) => self.size = *size,
-            Event::MouseDown(e) | Event::MouseUp(e) | Event::MouseMove(e) | Event::Wheel(e) => {
-                self.last_mouse_pos = Some(e.pos)
+            Event::MouseDown(mouse) if self.text().can_write() => {
+                if !ctx.is_disabled() {
+                    if !mouse.focus {
+                        ctx.request_focus();
+                        self.was_focused_from_click = true;
+                        self.reset_cursor_blink(ctx.request_timer(CURSOR_BLINK_DURATION));
+                    } else {
+                        ctx.set_handled();
+                    }
+                }
             }
-            Event::Internal(InternalEvent::MouseLeave) => self.last_mouse_pos = None,
+            Event::Timer(id) => {
+                if !ctx.is_disabled() {
+                    if *id == self.cursor_timer && ctx.has_focus() {
+                        self.cursor_on = !self.cursor_on;
+                        ctx.request_paint();
+                        self.cursor_timer = ctx.request_timer(CURSOR_BLINK_DURATION);
+                    }
+                } else if self.cursor_on {
+                    self.cursor_on = false;
+                    ctx.request_paint();
+                }
+            }
+            Event::ImeStateChange => {
+                self.reset_cursor_blink(ctx.request_timer(CURSOR_BLINK_DURATION));
+            }
+            Event::Command(ref cmd)
+                if !self.text().is_composing()
+                    && ctx.is_focused()
+                    && cmd.is(crate::commands::COPY) =>
+            {
+                self.text().borrow().set_clipboard();
+                ctx.set_handled();
+            }
+            Event::Command(cmd)
+                if !self.text().is_composing()
+                    && ctx.is_focused()
+                    && cmd.is(crate::commands::CUT) =>
+            {
+                if self.text().borrow().set_clipboard() {
+                    let inval = self.text_mut().borrow_mut().insert_text(data, "");
+                    ctx.invalidate_text_input(inval);
+                }
+                ctx.set_handled();
+            }
+            Event::Command(cmd)
+                if !self.text().is_composing()
+                    && ctx.is_focused()
+                    && cmd.is(crate::commands::SELECT_ALL) =>
+            {
+                if let Some(inval) = self
+                    .text_mut()
+                    .borrow_mut()
+                    .set_selection(Selection::new(0, data.as_str().len()))
+                {
+                    ctx.request_paint();
+                    ctx.invalidate_text_input(inval);
+                }
+                ctx.set_handled();
+            }
+            Event::Paste(ref item) if self.text().can_write() => {
+                if let Some(string) = item.get_string() {
+                    let text = if self.multiline {
+                        &string
+                    } else {
+                        string.lines().next().unwrap_or("")
+                    };
+                    if !text.is_empty() {
+                        let inval = self.text_mut().borrow_mut().insert_text(data, text);
+                        ctx.invalidate_text_input(inval);
+                    }
+                }
+            }
             _ => (),
         }
+        self.inner.event(ctx, event, data, env)
+    }
 
-        let event = match event {
-            Event::Timer(token) => {
-                if let Some(widget_id) = self.timers.remove(&token) {
-                    Event::Internal(InternalEvent::RouteTimer(token, widget_id))
-                } else {
-                    error!("No widget found for timer {:?}", token);
-                    return Handled::No;
+    #[instrument(name = "TextBox", level = "trace", skip(self, ctx, event, data, env))]
+    fn lifecycle(&mut self, ctx: &mut LifeCycleCtx, event: &LifeCycle, data: &T, env: &Env) {
+        match event {
+            LifeCycle::WidgetAdded => {
+                if matches!(event, LifeCycle::WidgetAdded) {
+                    self.placeholder_text.resolve(data, env);
                 }
+                ctx.register_text_input(self.text().input_handler());
             }
-            other => other,
-        };
+            LifeCycle::BuildFocusChain => {
+                //TODO: make this a configurable option? maybe?
+                ctx.register_for_focus();
+            }
+            LifeCycle::FocusChanged(true) => {
+                if self.text().can_write() && !self.multiline && !self.was_focused_from_click {
+                    let selection = Selection::new(0, data.len());
+                    let _ = self.text_mut().borrow_mut().set_selection(selection);
+                    ctx.invalidate_text_input(ImeInvalidation::SelectionChanged);
+                }
+                self.text_mut().has_focus = true;
+                self.reset_cursor_blink(ctx.request_timer(CURSOR_BLINK_DURATION));
+                self.was_focused_from_click = false;
+                ctx.request_paint();
+                ctx.scroll_to_view();
+            }
+            LifeCycle::FocusChanged(false) => {
+                if self.text().can_write() && MAC_OR_LINUX_OR_OBSD && !self.multiline {
+                    let selection = self.text().borrow().selection();
+                    let selection = Selection::new(selection.active, selection.active);
+                    let _ = self.text_mut().borrow_mut().set_selection(selection);
+                    ctx.invalidate_text_input(ImeInvalidation::SelectionChanged);
+                }
+                self.text_mut().has_focus = false;
+                if !self.multiline {
+                    self.inner.scroll_to(Rect::ZERO);
+                }
+                self.cursor_timer = TimerToken::INVALID;
+                self.was_focused_from_click = false;
+                ctx.request_paint();
+            }
+            _ => (),
+        }
+        self.inner.lifecycle(ctx, event, data, env);
+    }
 
-        if let Event::WindowConnected = event {
-            self.lifecycle(
-                queue,
-                &LifeCycle::Internal(InternalLifeCycle::RouteWidgetAdded),
-                data,
-                env,
-                false,
-            );
+    #[instrument(name = "TextBox", level = "trace", skip(self, ctx, old, data, env))]
+    fn update(&mut self, ctx: &mut UpdateCtx, old: &T, data: &T, env: &Env) {
+        let placeholder_changed = self.placeholder_text.resolve(data, env);
+        if placeholder_changed {
+            let new_text = self.placeholder_text.display_text();
+            self.placeholder_layout.set_text(new_text);
         }
 
-        let mut widget_state = WidgetState::new(self.root.id(), Some(self.size));
-        let is_handled = {
-            let mut state = ContextState::new::<T>(
-                queue,
-                &self.ext_handle,
-                &self.handle,
-                self.id,
-                self.focus,
-                &mut self.timers,
-                &mut self.pending_text_registrations,
-            );
-            let mut notifications = VecDeque::new();
-            let mut ctx = EventCtx {
-                state: &mut state,
-                notifications: &mut notifications,
-                widget_state: &mut widget_state,
-                is_handled: false,
-                is_root: true,
+        self.inner.update(ctx, old, data, env);
+        if placeholder_changed
+            || (ctx.env_changed() && self.placeholder_layout.needs_rebuild_after_update(ctx))
+        {
+            ctx.request_layout();
+        }
+        if self.text().can_write() {
+            if let Some(ime_invalidation) = self.text_mut().borrow_mut().pending_ime_invalidation()
+            {
+                ctx.invalidate_text_input(ime_invalidation);
+            }
+        }
+    }
+
+    #[instrument(name = "TextBox", level = "trace", skip(self, ctx, bc, data, env))]
+    fn layout(&mut self, ctx: &mut LayoutCtx, bc: &BoxConstraints, data: &T, env: &Env) -> Size {
+        if !self.text().can_write() {
+            tracing::warn!("Widget::layout called with outstanding IME lock.");
+        }
+        let min_width = env.get(theme::WIDE_WIDGET_WIDTH);
+        let textbox_insets = env.get(theme::TEXTBOX_INSETS);
+
+        self.placeholder_layout.rebuild_if_needed(ctx.text(), env);
+        let min_size = bc.constrain((min_width, 0.0));
+        let child_bc = BoxConstraints::new(min_size, bc.max());
+
+        let size = self.inner.layout(ctx, &child_bc, data, env);
+
+        let text_metrics = if !self.text().can_read() || data.is_empty() {
+            self.placeholder_layout.layout_metrics()
+        } else {
+            self.text().borrow().layout.layout_metrics()
+        };
+
+        let layout_baseline = text_metrics.size.height - text_metrics.first_baseline;
+        let baseline_off = layout_baseline
+            - (self.inner.child_size().height - self.inner.viewport_rect().height())
+            + textbox_insets.y1;
+        ctx.set_baseline_offset(baseline_off);
+        if self.scroll_to_selection_after_layout {
+            self.scroll_to_selection_end();
+            self.scroll_to_selection_after_layout = false;
+        }
+
+        trace!(
+            "Computed layout: size={}, baseline_offset={:?}",
+            size,
+            baseline_off
+        );
+        size
+    }
+
+    #[instrument(name = "TextBox", level = "trace", skip(self, ctx, data, env))]
+    fn paint(&mut self, ctx: &mut PaintCtx, data: &T, env: &Env) {
+        if !self.text().can_read() {
+            tracing::warn!("Widget::paint called with outstanding IME lock, skipping");
+            return;
+        }
+        let size = ctx.size();
+        let background_color = env.get(theme::BACKGROUND_LIGHT);
+        let cursor_color = env.get(theme::CURSOR_COLOR);
+        let border_width = env.get(theme::TEXTBOX_BORDER_WIDTH);
+        let textbox_insets = env.get(theme::TEXTBOX_INSETS);
+
+        let is_focused = ctx.is_focused();
+
+        let border_color = if is_focused {
+            env.get(theme::PRIMARY_LIGHT)
+        } else {
+            env.get(theme::BORDER_DARK)
+        };
+
+        // Paint the background
+        let clip_rect = size
+            .to_rect()
+            .inset(-border_width / 2.0)
+            .to_rounded_rect(env.get(theme::TEXTBOX_BORDER_RADIUS));
+
+        ctx.fill(clip_rect, &background_color);
+
+        if !data.is_empty() {
+            self.inner.paint(ctx, data, env);
+        } else {
+            let text_width = self.placeholder_layout.layout_metrics().size.width;
+            let extra_width = (size.width - text_width - textbox_insets.x_value()).max(0.);
+            let alignment = self.text().borrow().text_alignment();
+            // alignment is only used for single-line text boxes
+            let x_offset = if self.multiline {
+                0.0
+            } else {
+                x_offset_for_extra_width(alignment, extra_width)
             };
 
-            {
-                let _span = info_span!("event");
-                let _span = _span.enter();
-                self.root.event(&mut ctx, &event, data, env);
-            }
-
-            if !ctx.notifications.is_empty() {
-                info!("{} unhandled notifications:", ctx.notifications.len());
-                for (i, n) in ctx.notifications.iter().enumerate() {
-                    info!("{}: {:?}", i, n);
-                }
-            }
-            Handled::from(ctx.is_handled)
-        };
-
-        if let Some(cursor) = &widget_state.cursor {
-            self.handle.set_cursor(cursor);
-        } else if matches!(
-            event,
-            Event::MouseMove(..) | Event::Internal(InternalEvent::MouseLeave)
-        ) {
-            self.handle.set_cursor(&Cursor::Arrow);
+            // clip when we draw the placeholder, since it isn't in a clipbox
+            ctx.with_save(|ctx| {
+                ctx.clip(clip_rect);
+                self.placeholder_layout
+                    .draw(ctx, (textbox_insets.x0 + x_offset, textbox_insets.y0));
+            })
         }
 
-        if matches!(
-            (event, self.size_policy),
-            (Event::WindowSize(_), WindowSizePolicy::Content)
-        ) {
-            // Because our initial size can be zero, the window system won't ask us to paint.
-            // So layout ourselves and hopefully we resize
-            self.layout(queue, data, env);
+        // Paint the cursor if focused and there's no selection
+        if is_focused && self.should_draw_cursor() {
+            // if there's no data, we always draw the cursor based on
+            // our alignment.
+            let cursor_pos = self.text().borrow().selection().active;
+            let cursor_line = self
+                .text()
+                .borrow()
+                .cursor_line_for_text_position(cursor_pos);
+
+            let padding_offset = Vec2::new(textbox_insets.x0, textbox_insets.y0);
+
+            let mut cursor = if data.is_empty() {
+                cursor_line + padding_offset
+            } else {
+                cursor_line + padding_offset - self.inner.offset()
+            };
+
+            // Snap the cursor to the pixel grid so it stays sharp.
+            cursor.p0.x = cursor.p0.x.trunc() + 0.5;
+            cursor.p1.x = cursor.p0.x;
+
+            ctx.with_save(|ctx| {
+                ctx.clip(clip_rect);
+                ctx.stroke(cursor, &cursor_color, 1.);
+            })
         }
 
-        self.post_event_processing(&mut widget_state, queue, data, env, false);
-
-        is_handled
+        // Paint the border
+        ctx.stroke(clip_rect, &border_color, border_width);
     }
 
-    pub(crate) fn lifecycle(
-        &mut self,
-        queue: &mut CommandQueue,
-        event: &LifeCycle,
-        data: &T,
-        env: &Env,
-        process_commands: bool,
-    ) {
-        let mut widget_state = WidgetState::new(self.root.id(), Some(self.size));
-        let mut state = ContextState::new::<T>(
-            queue,
-            &self.ext_handle,
-            &self.handle,
-            self.id,
-            self.focus,
-            &mut self.timers,
-            &mut self.pending_text_registrations,
-        );
-        let mut ctx = LifeCycleCtx {
-            state: &mut state,
-            widget_state: &mut widget_state,
-        };
-
-        {
-            let _span = info_span!("lifecycle");
-            let _span = _span.enter();
-            self.root.lifecycle(&mut ctx, event, data, env);
+    fn debug_state(&self, data: &T) -> DebugState {
+        let text = data.slice(0..data.len()).unwrap_or_default();
+        DebugState {
+            display_name: self.short_type_name().to_string(),
+            main_value: text.to_string(),
+            ..Default::default()
         }
-
-        self.post_event_processing(&mut widget_state, queue, data, env, process_commands);
-    }
-
-    pub(crate) fn update(&mut self, queue: &mut CommandQueue, data: &T, env: &Env) {
-        self.update_title(data, env);
-
-        let mut widget_state = WidgetState::new(self.root.id(), Some(self.size));
-        let mut state = ContextState::new::<T>(
-            queue,
-            &self.ext_handle,
-            &self.handle,
-            self.id,
-            self.focus,
-            &mut self.timers,
-            &mut self.pending_text_registrations,
-        );
-        let mut update_ctx = UpdateCtx {
-            widget_state: &mut widget_state,
-            state: &mut state,
-            prev_env: None,
-            env,
-        };
-
-        {
-            let _span = info_span!("update");
-            let _span = _span.enter();
-            self.root.update(&mut update_ctx, data, env);
-        }
-
-        if let Some(cursor) = &widget_state.cursor {
-            self.handle.set_cursor(cursor);
-        }
-
-        self.post_event_processing(&mut widget_state, queue, data, env, false);
-    }
-
-    pub(crate) fn invalidate_and_finalize(&mut self) {
-        if self.root.state().needs_layout {
-            self.handle.invalidate();
-        } else {
-            for rect in self.invalid.rects() {
-                self.handle.invalidate_rect(*rect);
-            }
-        }
-        self.invalid.clear();
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn invalid(&self) -> &Region {
-        &self.invalid
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn invalid_mut(&mut self) -> &mut Region {
-        &mut self.invalid
-    }
-
-    /// Get ready for painting, by doing layout and sending an `AnimFrame` event.
-    pub(crate) fn prepare_paint(&mut self, queue: &mut CommandQueue, data: &mut T, env: &Env) {
-        let now = Instant::now();
-        // TODO: this calculation uses wall-clock time of the paint call, which
-        // potentially has jitter.
-        //
-        // See https://github.com/linebender/druid/issues/85 for discussion.
-        let last = self.last_anim.take();
-        let elapsed_ns = last.map(|t| now.duration_since(t).as_nanos()).unwrap_or(0) as u64;
-
-        if self.wants_animation_frame() {
-            self.event(queue, Event::AnimFrame(elapsed_ns), data, env);
-            self.last_anim = Some(now);
-        }
-    }
-
-    pub(crate) fn do_paint(
-        &mut self,
-        piet: &mut Piet,
-        invalid: &Region,
-        queue: &mut CommandQueue,
-        data: &T,
-        env: &Env,
-    ) {
-        if self.root.state().needs_layout {
-            self.layout(queue, data, env);
-        }
-
-        for &r in invalid.rects() {
-            piet.clear(
-                Some(r),
-                if self.transparent {
-                    Color::TRANSPARENT
-                } else {
-                    env.get(crate::theme::WINDOW_BACKGROUND_COLOR)
-                },
-            );
-        }
-        self.paint(piet, invalid, queue, data, env);
-    }
-
-    fn layout(&mut self, queue: &mut CommandQueue, data: &T, env: &Env) {
-        let mut widget_state = WidgetState::new(self.root.id(), Some(self.size));
-        let mut state = ContextState::new::<T>(
-            queue,
-            &self.ext_handle,
-            &self.handle,
-            self.id,
-            self.focus,
-            &mut self.timers,
-            &mut self.pending_text_registrations,
-        );
-        let mut layout_ctx = LayoutCtx {
-            state: &mut state,
-            widget_state: &mut widget_state,
-            mouse_pos: self.last_mouse_pos,
-        };
-        let bc = match self.size_policy {
-            WindowSizePolicy::User => BoxConstraints::tight(self.size),
-            WindowSizePolicy::Content => BoxConstraints::UNBOUNDED,
-        };
-
-        let content_size = {
-            let _span = info_span!("layout");
-            let _span = _span.enter();
-            self.root.layout(&mut layout_ctx, &bc, data, env)
-        };
-
-        if let WindowSizePolicy::Content = self.size_policy {
-            let insets = self.handle.content_insets();
-            let full_size = (content_size.to_rect() + insets).size();
-            if self.size != full_size {
-                self.size = full_size;
-                self.handle.set_size(full_size)
-            }
-        }
-        self.root
-            .set_origin(&mut layout_ctx, data, env, Point::ORIGIN);
-        self.lifecycle(
-            queue,
-            &LifeCycle::Internal(InternalLifeCycle::ParentWindowOrigin),
-            data,
-            env,
-            false,
-        );
-        self.post_event_processing(&mut widget_state, queue, data, env, true);
-    }
-
-    /// only expose `layout` for testing; normally it is called as part of `do_paint`
-    #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn just_layout(&mut self, queue: &mut CommandQueue, data: &T, env: &Env) {
-        self.layout(queue, data, env)
-    }
-
-    fn paint(
-        &mut self,
-        piet: &mut Piet,
-        invalid: &Region,
-        queue: &mut CommandQueue,
-        data: &T,
-        env: &Env,
-    ) {
-        let widget_state = WidgetState::new(self.root.id(), Some(self.size));
-        let mut state = ContextState::new::<T>(
-            queue,
-            &self.ext_handle,
-            &self.handle,
-            self.id,
-            self.focus,
-            &mut self.timers,
-            &mut self.pending_text_registrations,
-        );
-        let mut ctx = PaintCtx {
-            render_ctx: piet,
-            state: &mut state,
-            widget_state: &widget_state,
-            z_ops: Vec::new(),
-            region: invalid.clone(),
-            depth: 0,
-        };
-
-        let root = &mut self.root;
-        info_span!("paint").in_scope(|| {
-            ctx.with_child_ctx(invalid.clone(), |ctx| root.paint_raw(ctx, data, env));
-        });
-
-        let mut z_ops = mem::take(&mut ctx.z_ops);
-        z_ops.sort_by_key(|k| k.z_index);
-
-        for z_op in z_ops.into_iter() {
-            ctx.with_child_ctx(invalid.clone(), |ctx| {
-                ctx.with_save(|ctx| {
-                    ctx.render_ctx.transform(z_op.transform);
-                    (z_op.paint_func)(ctx);
-                });
-            });
-        }
-
-        if self.wants_animation_frame() {
-            self.handle.request_anim_frame();
-        }
-    }
-
-    /// Get a best-effort representation of the entire widget tree for debug purposes.
-    pub fn root_debug_state(&self, data: &T) -> DebugState {
-        self.root.widget().debug_state(data)
-    }
-
-    pub(crate) fn update_title(&mut self, data: &T, env: &Env) {
-        if self.title.resolve(data, env) {
-            self.handle.set_title(&self.title.display_text());
-        }
-    }
-
-    pub(crate) fn update_menu(&mut self, data: &T, env: &Env) {
-        if let Some(menu) = &mut self.menu {
-            if let Some(new_menu) = menu.update(Some(self.id), data, env) {
-                self.handle.set_menu(new_menu);
-            }
-        }
-        if let Some((menu, point)) = &mut self.context_menu {
-            if let Some(new_menu) = menu.update(Some(self.id), data, env) {
-                self.handle.show_context_menu(new_menu, *point);
-            }
-        }
-    }
-
-    pub(crate) fn get_ime_handler(
-        &mut self,
-        req_token: TextFieldToken,
-        mutable: bool,
-    ) -> Box<dyn InputHandler> {
-        self.ime_handlers
-            .iter()
-            .find(|(token, _)| req_token == *token)
-            .and_then(|(_, reg)| reg.document.acquire(mutable))
-            .unwrap()
-    }
-
-    fn update_focus(
-        &mut self,
-        widget_state: &mut WidgetState,
-        queue: &mut CommandQueue,
-        data: &T,
-        env: &Env,
-    ) {
-        if let Some(focus_req) = widget_state.request_focus.take() {
-            let old = self.focus;
-            let new = self.widget_for_focus_request(focus_req);
-            // Only send RouteFocusChanged in case there's actual change
-            if old != new {
-                let event = LifeCycle::Internal(InternalLifeCycle::RouteFocusChanged { old, new });
-                self.lifecycle(queue, &event, data, env, false);
-                self.focus = new;
-                // check if the newly focused widget has an IME session, and
-                // notify the system if so.
-                //
-                // If you're here because a profiler sent you: I guess I should've
-                // used a hashmap?
-                let old_was_ime = old
-                    .map(|old| {
-                        self.ime_handlers
-                            .iter()
-                            .any(|(_, sesh)| sesh.widget_id == old)
-                    })
-                    .unwrap_or(false);
-                let maybe_active_text_field = self
-                    .ime_handlers
-                    .iter()
-                    .find(|(_, sesh)| Some(sesh.widget_id) == self.focus)
-                    .map(|(token, _)| *token);
-                // we call this on every focus change; we could call it less but does it matter?
-                self.ime_focus_change = if maybe_active_text_field.is_some() {
-                    Some(maybe_active_text_field)
-                } else if old_was_ime {
-                    Some(None)
-                } else {
-                    None
-                };
-            }
-        }
-    }
-
-    /// Create a function that can invalidate the provided widget's text state.
-    ///
-    /// This will be called from outside the main app state in order to avoid
-    /// reentrancy problems.
-    pub(crate) fn ime_invalidation_fn(&self, widget: WidgetId) -> Option<Box<ImeUpdateFn>> {
-        let token = self
-            .ime_handlers
-            .iter()
-            .find(|(_, reg)| reg.widget_id == widget)
-            .map(|(t, _)| *t)?;
-        let window_handle = self.handle.clone();
-        Some(Box::new(move |event| {
-            window_handle.update_text_field(token, event)
-        }))
-    }
-
-    /// Release a lock on an IME session, returning a `WidgetId` if the lock was mutable.
-    ///
-    /// After a mutable lock is released, the widget needs to be notified so that
-    /// it can update any internal state.
-    pub(crate) fn release_ime_lock(&mut self, req_token: TextFieldToken) -> Option<WidgetId> {
-        self.ime_handlers
-            .iter()
-            .find(|(token, _)| req_token == *token)
-            .and_then(|(_, reg)| reg.document.release().then(|| reg.widget_id))
-    }
-
-    fn widget_for_focus_request(&self, focus: FocusChange) -> Option<WidgetId> {
-        match focus {
-            FocusChange::Resign => None,
-            FocusChange::Focus(id) => Some(id),
-            FocusChange::Next => self.widget_from_focus_chain(true),
-            FocusChange::Previous => self.widget_from_focus_chain(false),
-        }
-    }
-
-    fn widget_from_focus_chain(&self, forward: bool) -> Option<WidgetId> {
-        self.focus.and_then(|focus| {
-            self.focus_chain()
-                .iter()
-                // Find where the focused widget is in the focus chain
-                .position(|id| id == &focus)
-                .map(|idx| {
-                    // Return the id that's next to it in the focus chain
-                    let len = self.focus_chain().len();
-                    let new_idx = if forward {
-                        (idx + 1) % len
-                    } else {
-                        (idx + len - 1) % len
-                    };
-                    self.focus_chain()[new_idx]
-                })
-                .or_else(|| {
-                    // If the currently focused widget isn't in the focus chain,
-                    // then we'll just return the first/last entry of the chain, if any.
-                    if forward {
-                        self.focus_chain().first().copied()
-                    } else {
-                        self.focus_chain().last().copied()
-                    }
-                })
-        })
     }
 }
 
-impl WindowId {
-    /// Allocate a new, unique window id.
-    pub fn next() -> WindowId {
-        static WINDOW_COUNTER: Counter = Counter::new();
-        WindowId(WINDOW_COUNTER.next())
+impl<T: TextStorage + EditableText> Default for TextBox<T> {
+    fn default() -> Self {
+        TextBox::new()
+    }
+}
+
+fn x_offset_for_extra_width(alignment: TextAlignment, extra_width: f64) -> f64 {
+    match alignment {
+        TextAlignment::Start | TextAlignment::Justified => 0.0,
+        TextAlignment::End => extra_width,
+        TextAlignment::Center => extra_width / 2.0,
     }
 }
