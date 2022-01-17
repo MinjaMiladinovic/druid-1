@@ -12,590 +12,694 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Window building and app lifecycle.
+//! Management of multiple windows.
 
-use crate::ext_event::{ExtEventHost, ExtEventSink};
-use crate::kurbo::{Point, Size};
-use crate::menu::MenuManager;
-use crate::shell::{Application, Error as PlatformError, WindowBuilder, WindowHandle, WindowLevel};
+use std::collections::{HashMap, VecDeque};
+use std::mem;
+use tracing::{error, info, info_span};
+
+// Automatically defaults to std::time::Instant on non Wasm platforms
+use instant::Instant;
+
+use crate::piet::{Color, Piet, RenderContext};
+use crate::shell::{text::InputHandler, Counter, Cursor, Region, TextFieldToken, WindowHandle};
+
+use crate::app::{PendingWindow, WindowSizePolicy};
+use crate::contexts::ContextState;
+use crate::core::{CommandQueue, FocusChange, WidgetState};
+use crate::debug_state::DebugState;
+use crate::menu::{MenuItemId, MenuManager};
+use crate::text::TextFieldRegistration;
 use crate::widget::LabelText;
-use crate::win_handler::{AppHandler, AppState};
-use crate::window::WindowId;
-use crate::{AppDelegate, Data, Env, LocalizedString, Menu, Widget};
+use crate::win_handler::RUN_COMMANDS_TOKEN;
+use crate::{
+    BoxConstraints, Data, Env, Event, EventCtx, ExtEventSink, Handled, InternalEvent,
+    InternalLifeCycle, LayoutCtx, LifeCycle, LifeCycleCtx, Menu, PaintCtx, Point, Size, TimerToken,
+    UpdateCtx, Widget, WidgetId, WidgetPod,
+};
 
-use tracing::warn;
+pub type ImeUpdateFn = dyn FnOnce(crate::shell::text::Event);
 
-use druid_shell::WindowState;
+/// A unique identifier for a window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct WindowId(u64);
 
-/// A function that modifies the initial environment.
-type EnvSetupFn<T> = dyn FnOnce(&mut Env, &T);
-
-/// Handles initial setup of an application, and starts the runloop.
-pub struct AppLauncher<T> {
-    windows: Vec<WindowDesc<T>>,
-    env_setup: Option<Box<EnvSetupFn<T>>>,
-    l10n_resources: Option<(Vec<String>, String)>,
-    delegate: Option<Box<dyn AppDelegate<T>>>,
-    ext_event_host: ExtEventHost,
-}
-
-/// Defines how a windows size should be determined
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub enum WindowSizePolicy {
-    /// Use the content of the window to determine the size.
-    ///
-    /// If you use this option, your root widget will be passed infinite constraints;
-    /// you are responsible for ensuring that your content picks an appropriate size.
-    Content,
-    /// Use the provided window size
-    User,
-}
-
-/// Window configuration that can be applied to a WindowBuilder, or to an existing WindowHandle.
-/// It does not include anything related to app data.
-#[derive(PartialEq)]
-pub struct WindowConfig {
-    pub(crate) size_policy: WindowSizePolicy,
-    pub(crate) size: Option<Size>,
-    pub(crate) min_size: Option<Size>,
-    pub(crate) position: Option<Point>,
-    pub(crate) resizable: Option<bool>,
-    pub(crate) transparent: Option<bool>,
-    pub(crate) show_titlebar: Option<bool>,
-    pub(crate) level: Option<WindowLevel>,
-    pub(crate) state: Option<WindowState>,
-}
-
-/// A description of a window to be instantiated.
-pub struct WindowDesc<T> {
-    pub(crate) pending: PendingWindow<T>,
-    pub(crate) config: WindowConfig,
-    /// The `WindowId` that will be assigned to this window.
-    ///
-    /// This can be used to track a window from when it is launched and when
-    /// it actually connects.
-    pub id: WindowId,
-}
-
-/// The parts of a window, pending construction, that are dependent on top level app state
-/// or are not part of the druid shells windowing abstraction.
-/// This includes the boxed root widget, as well as other window properties such as the title.
-pub struct PendingWindow<T> {
-    pub(crate) root: Box<dyn Widget<T>>,
+/// Per-window state not owned by user code.
+pub struct Window<T> {
+    pub(crate) id: WindowId,
+    pub(crate) root: WidgetPod<T, Box<dyn Widget<T>>>,
     pub(crate) title: LabelText<T>,
-    pub(crate) transparent: bool,
+    size_policy: WindowSizePolicy,
+    size: Size,
+    invalid: Region,
     pub(crate) menu: Option<MenuManager<T>>,
-    pub(crate) size_policy: WindowSizePolicy, // This is copied over from the WindowConfig
-                                              // when the native window is constructed.
+    pub(crate) context_menu: Option<(MenuManager<T>, Point)>,
+    // This will be `Some` whenever the most recently displayed frame was an animation frame.
+    pub(crate) last_anim: Option<Instant>,
+    pub(crate) last_mouse_pos: Option<Point>,
+    pub(crate) focus: Option<WidgetId>,
+    pub(crate) handle: WindowHandle,
+    pub(crate) timers: HashMap<TimerToken, WidgetId>,
+    pub(crate) pending_text_registrations: Vec<TextFieldRegistration>,
+    pub(crate) transparent: bool,
+    pub(crate) ime_handlers: Vec<(TextFieldToken, TextFieldRegistration)>,
+    ext_handle: ExtEventSink,
+    pub(crate) ime_focus_change: Option<Option<TextFieldToken>>,
 }
 
-impl<T: Data> PendingWindow<T> {
-    /// Create a pending window from any widget.
-    pub fn new<W>(root: W) -> PendingWindow<T>
-    where
-        W: Widget<T> + 'static,
-    {
-        // This just makes our API slightly cleaner; callers don't need to explicitly box.
-        PendingWindow {
-            root: Box::new(root),
-            title: LocalizedString::new("app-name").into(),
-            menu: MenuManager::platform_default(),
-            transparent: false,
-            size_policy: WindowSizePolicy::User,
+impl<T> Window<T> {
+    pub(crate) fn new(
+        id: WindowId,
+        handle: WindowHandle,
+        pending: PendingWindow<T>,
+        ext_handle: ExtEventSink,
+    ) -> Window<T> {
+        Window {
+            id,
+            root: WidgetPod::new(pending.root),
+            size_policy: pending.size_policy,
+            size: Size::ZERO,
+            invalid: Region::EMPTY,
+            title: pending.title,
+            transparent: pending.transparent,
+            menu: pending.menu,
+            context_menu: None,
+            last_anim: None,
+            last_mouse_pos: None,
+            focus: None,
+            handle,
+            timers: HashMap::new(),
+            ext_handle,
+            ime_handlers: Vec::new(),
+            ime_focus_change: None,
+            pending_text_registrations: Vec::new(),
         }
-    }
-
-    /// Set the title for this window. This is a [`LabelText`]; it can be either
-    /// a `String`, a [`LocalizedString`], or a closure that computes a string;
-    /// it will be kept up to date as the application's state changes.
-    ///
-    /// [`LabelText`]: widget/enum.LocalizedString.html
-    /// [`LocalizedString`]: struct.LocalizedString.html
-    pub fn title(mut self, title: impl Into<LabelText<T>>) -> Self {
-        self.title = title.into();
-        self
-    }
-
-    /// Set wether the background should be transparent
-    pub fn transparent(mut self, transparent: bool) -> Self {
-        self.transparent = transparent;
-        self
-    }
-
-    /// Set the menu for this window.
-    ///
-    /// `menu` is a callback for creating the menu. Its first argument is the id of the window that
-    /// will have the menu, or `None` if it's creating the root application menu for an app with no
-    /// menus (which can happen, for example, on macOS).
-    pub fn menu(
-        mut self,
-        menu: impl FnMut(Option<WindowId>, &T, &Env) -> Menu<T> + 'static,
-    ) -> Self {
-        self.menu = Some(MenuManager::new(menu));
-        self
     }
 }
 
-impl<T: Data> AppLauncher<T> {
-    /// Create a new `AppLauncher` with the provided window.
-    pub fn with_window(window: WindowDesc<T>) -> Self {
-        AppLauncher {
-            windows: vec![window],
-            env_setup: None,
-            l10n_resources: None,
-            delegate: None,
-            ext_event_host: ExtEventHost::new(),
+impl<T: Data> Window<T> {
+    /// `true` iff any child requested an animation frame since the last `AnimFrame` event.
+    pub(crate) fn wants_animation_frame(&self) -> bool {
+        self.root.state().request_anim
+    }
+
+    pub(crate) fn focus_chain(&self) -> &[WidgetId] {
+        &self.root.state().focus_chain
+    }
+
+    /// Returns `true` if the provided widget may be in this window,
+    /// but it may also be a false positive.
+    /// However when this returns `false` the widget is definitely not in this window.
+    pub(crate) fn may_contain_widget(&self, widget_id: WidgetId) -> bool {
+        // The bloom filter we're checking can return false positives.
+        widget_id == self.root.id() || self.root.state().children.may_contain(&widget_id)
+    }
+
+    pub(crate) fn menu_cmd(
+        &mut self,
+        queue: &mut CommandQueue,
+        cmd_id: MenuItemId,
+        data: &mut T,
+        env: &Env,
+    ) {
+        if let Some(menu) = &mut self.menu {
+            menu.event(queue, Some(self.id), cmd_id, data, env);
+        }
+        if let Some((menu, _)) = &mut self.context_menu {
+            menu.event(queue, Some(self.id), cmd_id, data, env);
         }
     }
 
-    /// Provide an optional closure that will be given mutable access to
-    /// the environment and immutable access to the app state before launch.
-    ///
-    /// This can be used to set or override theme values.
-    pub fn configure_env(mut self, f: impl Fn(&mut Env, &T) + 'static) -> Self {
-        self.env_setup = Some(Box::new(f));
-        self
+    pub(crate) fn show_context_menu(&mut self, menu: Menu<T>, point: Point, data: &T, env: &Env) {
+        let mut manager = MenuManager::new_for_popup(menu);
+        self.handle
+            .show_context_menu(manager.initialize(Some(self.id), data, env), point);
+        self.context_menu = Some((manager, point));
     }
 
-    /// Set the [`AppDelegate`].
-    ///
-    /// [`AppDelegate`]: trait.AppDelegate.html
-    pub fn delegate(mut self, delegate: impl AppDelegate<T> + 'static) -> Self {
-        self.delegate = Some(Box::new(delegate));
-        self
+    /// On macos we need to update the global application menu to be the menu
+    /// for the current window.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn macos_update_app_menu(&mut self, data: &T, env: &Env) {
+        if let Some(menu) = self.menu.as_mut() {
+            self.handle.set_menu(menu.refresh(data, env));
+        }
     }
 
-    /// Initialize a minimal logger with DEBUG max level for printing logs out to stderr.
-    ///
-    /// This is meant for use during development only.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the logger fails to initialize.
-    #[deprecated(since = "0.7.0", note = "Use log_to_console instead")]
-    pub fn use_simple_logger(self) -> Self {
-        self.log_to_console()
+    fn post_event_processing(
+        &mut self,
+        widget_state: &mut WidgetState,
+        queue: &mut CommandQueue,
+        data: &T,
+        env: &Env,
+        process_commands: bool,
+    ) {
+        // If children are changed during the handling of an event,
+        // we need to send RouteWidgetAdded now, so that they are ready for update/layout.
+        if widget_state.children_changed {
+            // Anytime widgets are removed we check and see if any of those
+            // widgets had IME sessions and unregister them if so.
+            let Window {
+                ime_handlers,
+                handle,
+                ..
+            } = self;
+            ime_handlers.retain(|(token, v)| {
+                let will_retain = v.is_alive();
+                if !will_retain {
+                    tracing::debug!("{:?} removed", token);
+                    handle.remove_text_field(*token);
+                }
+                will_retain
+            });
+
+            self.lifecycle(
+                queue,
+                &LifeCycle::Internal(InternalLifeCycle::RouteWidgetAdded),
+                data,
+                env,
+                false,
+            );
+        }
+
+        if self.root.state().needs_window_origin && !self.root.state().needs_layout {
+            let event = LifeCycle::Internal(InternalLifeCycle::ParentWindowOrigin);
+            self.lifecycle(queue, &event, data, env, false);
+        }
+
+        // Update the disabled state if necessary
+        // Always do this before updating the focus-chain
+        if self.root.state().tree_disabled_changed() {
+            let event = LifeCycle::Internal(InternalLifeCycle::RouteDisabledChanged);
+            self.lifecycle(queue, &event, data, env, false);
+        }
+
+        // Update the focus-chain if necessary
+        // Always do this before sending focus change, since this event updates the focus chain.
+        if self.root.state().update_focus_chain {
+            let event = LifeCycle::BuildFocusChain;
+            self.lifecycle(queue, &event, data, env, false);
+        }
+
+        self.update_focus(widget_state, queue, data, env);
+
+        // If we need a new paint pass, make sure druid-shell knows it.
+        if self.wants_animation_frame() {
+            self.handle.request_anim_frame();
+        }
+        self.invalid.union_with(&widget_state.invalid);
+        for ime_field in self.pending_text_registrations.drain(..) {
+            let token = self.handle.add_text_field();
+            tracing::debug!("{:?} added", token);
+            self.ime_handlers.push((token, ime_field));
+        }
+
+        // If there are any commands and they should be processed
+        if process_commands && !queue.is_empty() {
+            // Ask the handler to call us back on idle
+            // so we can process them in a new event/update pass.
+            if let Some(mut handle) = self.handle.get_idle_handle() {
+                handle.schedule_idle(RUN_COMMANDS_TOKEN);
+            } else {
+                error!("failed to get idle handle");
+            }
+        }
     }
 
-    /// Initialize a minimal tracing subscriber with DEBUG max level for printing logs out to
-    /// stderr.
-    ///
-    /// This is meant for quick-and-dirty debugging. If you want more serious trace handling,
-    /// it's probably better to implement it yourself.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the subscriber fails to initialize, for example if a `tracing`/`tracing_wasm`
-    /// global logger was already set.
-    pub fn log_to_console(self) -> Self {
-        #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn event(
+        &mut self,
+        queue: &mut CommandQueue,
+        event: Event,
+        data: &mut T,
+        env: &Env,
+    ) -> Handled {
+        match &event {
+            Event::WindowSize(size) => self.size = *size,
+            Event::MouseDown(e) | Event::MouseUp(e) | Event::MouseMove(e) | Event::Wheel(e) => {
+                self.last_mouse_pos = Some(e.pos)
+            }
+            Event::Internal(InternalEvent::MouseLeave) => self.last_mouse_pos = None,
+            _ => (),
+        }
+
+        let event = match event {
+            Event::Timer(token) => {
+                if let Some(widget_id) = self.timers.remove(&token) {
+                    Event::Internal(InternalEvent::RouteTimer(token, widget_id))
+                } else {
+                    error!("No widget found for timer {:?}", token);
+                    return Handled::No;
+                }
+            }
+            other => other,
+        };
+
+        if let Event::WindowConnected = event {
+            self.lifecycle(
+                queue,
+                &LifeCycle::Internal(InternalLifeCycle::RouteWidgetAdded),
+                data,
+                env,
+                false,
+            );
+        }
+
+        let mut widget_state = WidgetState::new(self.root.id(), Some(self.size));
+        let is_handled = {
+            let mut state = ContextState::new::<T>(
+                queue,
+                &self.ext_handle,
+                &self.handle,
+                self.id,
+                self.focus,
+                &mut self.timers,
+                &mut self.pending_text_registrations,
+            );
+            let mut notifications = VecDeque::new();
+            let mut ctx = EventCtx {
+                state: &mut state,
+                notifications: &mut notifications,
+                widget_state: &mut widget_state,
+                is_handled: false,
+                is_root: true,
+            };
+
+            {
+                let _span = info_span!("event");
+                let _span = _span.enter();
+                self.root.event(&mut ctx, &event, data, env);
+            }
+
+            if !ctx.notifications.is_empty() {
+                info!("{} unhandled notifications:", ctx.notifications.len());
+                for (i, n) in ctx.notifications.iter().enumerate() {
+                    info!("{}: {:?}", i, n);
+                }
+            }
+            Handled::from(ctx.is_handled)
+        };
+
+        if let Some(cursor) = &widget_state.cursor {
+            self.handle.set_cursor(cursor);
+        } else if matches!(
+            event,
+            Event::MouseMove(..) | Event::Internal(InternalEvent::MouseLeave)
+        ) {
+            self.handle.set_cursor(&Cursor::Arrow);
+        }
+
+        if matches!(
+            (event, self.size_policy),
+            (Event::WindowSize(_), WindowSizePolicy::Content)
+        ) {
+            // Because our initial size can be zero, the window system won't ask us to paint.
+            // So layout ourselves and hopefully we resize
+            self.layout(queue, data, env);
+        }
+
+        self.post_event_processing(&mut widget_state, queue, data, env, false);
+
+        is_handled
+    }
+
+    pub(crate) fn lifecycle(
+        &mut self,
+        queue: &mut CommandQueue,
+        event: &LifeCycle,
+        data: &T,
+        env: &Env,
+        process_commands: bool,
+    ) {
+        let mut widget_state = WidgetState::new(self.root.id(), Some(self.size));
+        let mut state = ContextState::new::<T>(
+            queue,
+            &self.ext_handle,
+            &self.handle,
+            self.id,
+            self.focus,
+            &mut self.timers,
+            &mut self.pending_text_registrations,
+        );
+        let mut ctx = LifeCycleCtx {
+            state: &mut state,
+            widget_state: &mut widget_state,
+        };
+
         {
-            use tracing_subscriber::prelude::*;
-            let filter_layer = tracing_subscriber::filter::LevelFilter::DEBUG;
-            let fmt_layer = tracing_subscriber::fmt::layer()
-                // Display target (eg "my_crate::some_mod::submod") with logs
-                .with_target(true);
-
-            tracing_subscriber::registry()
-                .with(filter_layer)
-                .with(fmt_layer)
-                .init();
+            let _span = info_span!("lifecycle");
+            let _span = _span.enter();
+            self.root.lifecycle(&mut ctx, event, data, env);
         }
-        // Note - tracing-wasm might not work in headless Node.js. Probably doesn't matter anyway,
-        // because this is a GUI framework, so wasm targets will virtually always be browsers.
-        #[cfg(target_arch = "wasm32")]
+
+        self.post_event_processing(&mut widget_state, queue, data, env, process_commands);
+    }
+
+    pub(crate) fn update(&mut self, queue: &mut CommandQueue, data: &T, env: &Env) {
+        self.update_title(data, env);
+
+        let mut widget_state = WidgetState::new(self.root.id(), Some(self.size));
+        let mut state = ContextState::new::<T>(
+            queue,
+            &self.ext_handle,
+            &self.handle,
+            self.id,
+            self.focus,
+            &mut self.timers,
+            &mut self.pending_text_registrations,
+        );
+        let mut update_ctx = UpdateCtx {
+            widget_state: &mut widget_state,
+            state: &mut state,
+            prev_env: None,
+            env,
+        };
+
         {
-            console_error_panic_hook::set_once();
-            let config = tracing_wasm::WASMLayerConfigBuilder::new()
-                .set_max_level(tracing::Level::DEBUG)
-                .build();
-            tracing_wasm::set_as_global_default_with_config(config)
-        }
-        self
-    }
-
-    /// Use custom localization resource
-    ///
-    /// `resources` is a list of file names that contain strings. `base_dir`
-    /// is a path to a directory that includes per-locale subdirectories.
-    ///
-    /// This directory should be of the structure `base_dir/{locale}/{resource}`,
-    /// where '{locale}' is a valid BCP47 language tag, and {resource} is a `.ftl`
-    /// included in `resources`.
-    pub fn localization_resources(mut self, resources: Vec<String>, base_dir: String) -> Self {
-        self.l10n_resources = Some((resources, base_dir));
-        self
-    }
-
-    /// Returns an [`ExtEventSink`] that can be moved between threads,
-    /// and can be used to submit commands back to the application.
-    ///
-    /// [`ExtEventSink`]: struct.ExtEventSink.html
-    pub fn get_external_handle(&self) -> ExtEventSink {
-        self.ext_event_host.make_sink()
-    }
-
-    /// Build the windows and start the runloop.
-    ///
-    /// Returns an error if a window cannot be instantiated. This is usually
-    /// a fatal error.
-    pub fn launch(mut self, data: T) -> Result<(), PlatformError> {
-        let app = Application::new()?;
-
-        let mut env = self
-            .l10n_resources
-            .map(|it| Env::with_i10n(it.0, &it.1))
-            .unwrap_or_else(Env::with_default_i10n);
-
-        if let Some(f) = self.env_setup.take() {
-            f(&mut env, &data);
+            let _span = info_span!("update");
+            let _span = _span.enter();
+            self.root.update(&mut update_ctx, data, env);
         }
 
-        let mut state = AppState::new(
-            app.clone(),
+        if let Some(cursor) = &widget_state.cursor {
+            self.handle.set_cursor(cursor);
+        }
+
+        self.post_event_processing(&mut widget_state, queue, data, env, false);
+    }
+
+    pub(crate) fn invalidate_and_finalize(&mut self) {
+        if self.root.state().needs_layout {
+            self.handle.invalidate();
+        } else {
+            for rect in self.invalid.rects() {
+                self.handle.invalidate_rect(*rect);
+            }
+        }
+        self.invalid.clear();
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn invalid(&self) -> &Region {
+        &self.invalid
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn invalid_mut(&mut self) -> &mut Region {
+        &mut self.invalid
+    }
+
+    /// Get ready for painting, by doing layout and sending an `AnimFrame` event.
+    pub(crate) fn prepare_paint(&mut self, queue: &mut CommandQueue, data: &mut T, env: &Env) {
+        let now = Instant::now();
+        // TODO: this calculation uses wall-clock time of the paint call, which
+        // potentially has jitter.
+        //
+        // See https://github.com/linebender/druid/issues/85 for discussion.
+        let last = self.last_anim.take();
+        let elapsed_ns = last.map(|t| now.duration_since(t).as_nanos()).unwrap_or(0) as u64;
+
+        if self.wants_animation_frame() {
+            self.event(queue, Event::AnimFrame(elapsed_ns), data, env);
+            self.last_anim = Some(now);
+        }
+    }
+
+    pub(crate) fn do_paint(
+        &mut self,
+        piet: &mut Piet,
+        invalid: &Region,
+        queue: &mut CommandQueue,
+        data: &T,
+        env: &Env,
+    ) {
+        if self.root.state().needs_layout {
+            self.layout(queue, data, env);
+        }
+
+        for &r in invalid.rects() {
+            piet.clear(
+                Some(r),
+                if self.transparent {
+                    Color::TRANSPARENT
+                } else {
+                    env.get(crate::theme::WINDOW_BACKGROUND_COLOR)
+                },
+            );
+        }
+        self.paint(piet, invalid, queue, data, env);
+    }
+
+    fn layout(&mut self, queue: &mut CommandQueue, data: &T, env: &Env) {
+        let mut widget_state = WidgetState::new(self.root.id(), Some(self.size));
+        let mut state = ContextState::new::<T>(
+            queue,
+            &self.ext_handle,
+            &self.handle,
+            self.id,
+            self.focus,
+            &mut self.timers,
+            &mut self.pending_text_registrations,
+        );
+        let mut layout_ctx = LayoutCtx {
+            state: &mut state,
+            widget_state: &mut widget_state,
+            mouse_pos: self.last_mouse_pos,
+        };
+        let bc = match self.size_policy {
+            WindowSizePolicy::User => BoxConstraints::tight(self.size),
+            WindowSizePolicy::Content => BoxConstraints::UNBOUNDED,
+        };
+
+        let content_size = {
+            let _span = info_span!("layout");
+            let _span = _span.enter();
+            self.root.layout(&mut layout_ctx, &bc, data, env)
+        };
+
+        if let WindowSizePolicy::Content = self.size_policy {
+            let insets = self.handle.content_insets();
+            let full_size = (content_size.to_rect() + insets).size();
+            if self.size != full_size {
+                self.size = full_size;
+                self.handle.set_size(full_size)
+            }
+        }
+        self.root
+            .set_origin(&mut layout_ctx, data, env, Point::ORIGIN);
+        self.lifecycle(
+            queue,
+            &LifeCycle::Internal(InternalLifeCycle::ParentWindowOrigin),
             data,
             env,
-            self.delegate.take(),
-            self.ext_event_host,
+            false,
         );
+        self.post_event_processing(&mut widget_state, queue, data, env, true);
+    }
 
-        for desc in self.windows {
-            let window = desc.build_native(&mut state)?;
-            window.show();
+    /// only expose `layout` for testing; normally it is called as part of `do_paint`
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn just_layout(&mut self, queue: &mut CommandQueue, data: &T, env: &Env) {
+        self.layout(queue, data, env)
+    }
+
+    fn paint(
+        &mut self,
+        piet: &mut Piet,
+        invalid: &Region,
+        queue: &mut CommandQueue,
+        data: &T,
+        env: &Env,
+    ) {
+        let widget_state = WidgetState::new(self.root.id(), Some(self.size));
+        let mut state = ContextState::new::<T>(
+            queue,
+            &self.ext_handle,
+            &self.handle,
+            self.id,
+            self.focus,
+            &mut self.timers,
+            &mut self.pending_text_registrations,
+        );
+        let mut ctx = PaintCtx {
+            render_ctx: piet,
+            state: &mut state,
+            widget_state: &widget_state,
+            z_ops: Vec::new(),
+            region: invalid.clone(),
+            depth: 0,
+        };
+
+        let root = &mut self.root;
+        info_span!("paint").in_scope(|| {
+            ctx.with_child_ctx(invalid.clone(), |ctx| root.paint_raw(ctx, data, env));
+        });
+
+        let mut z_ops = mem::take(&mut ctx.z_ops);
+        z_ops.sort_by_key(|k| k.z_index);
+
+        for z_op in z_ops.into_iter() {
+            ctx.with_child_ctx(invalid.clone(), |ctx| {
+                ctx.with_save(|ctx| {
+                    ctx.render_ctx.transform(z_op.transform);
+                    (z_op.paint_func)(ctx);
+                });
+            });
         }
 
-        let handler = AppHandler::new(state);
-        app.run(Some(Box::new(handler)));
-        Ok(())
-    }
-}
-
-impl Default for WindowConfig {
-    fn default() -> Self {
-        WindowConfig {
-            size_policy: WindowSizePolicy::User,
-            size: None,
-            min_size: None,
-            position: None,
-            resizable: None,
-            show_titlebar: None,
-            transparent: None,
-            level: None,
-            state: None,
+        if self.wants_animation_frame() {
+            self.handle.request_anim_frame();
         }
     }
-}
 
-impl WindowConfig {
-    /// Set the window size policy.
-    pub fn window_size_policy(mut self, size_policy: WindowSizePolicy) -> Self {
-        #[cfg(windows)]
-        {
-            // On Windows content_insets doesn't work on window with no initial size
-            // so the window size can't be adapted to the content, to fix this a
-            // non null initial size is set here.
-            if size_policy == WindowSizePolicy::Content {
-                self.size = Some(Size::new(1., 1.))
+    /// Get a best-effort representation of the entire widget tree for debug purposes.
+    pub fn root_debug_state(&self, data: &T) -> DebugState {
+        self.root.widget().debug_state(data)
+    }
+
+    pub(crate) fn update_title(&mut self, data: &T, env: &Env) {
+        if self.title.resolve(data, env) {
+            self.handle.set_title(&self.title.display_text());
+        }
+    }
+
+    pub(crate) fn update_menu(&mut self, data: &T, env: &Env) {
+        if let Some(menu) = &mut self.menu {
+            if let Some(new_menu) = menu.update(Some(self.id), data, env) {
+                self.handle.set_menu(new_menu);
             }
         }
-        self.size_policy = size_policy;
-        self
-    }
-
-    /// Set the window's initial drawing area size in [display points].
-    ///
-    /// You can pass in a tuple `(width, height)` or a [`Size`],
-    /// e.g. to create a window with a drawing area 1000dp wide and 500dp high:
-    ///
-    /// ```ignore
-    /// window.window_size((1000.0, 500.0));
-    /// ```
-    ///
-    /// The actual window size in pixels will depend on the platform DPI settings.
-    ///
-    /// This should be considered a request to the platform to set the size of the window.
-    /// The platform might increase the size a tiny bit due to DPI.
-    ///
-    /// [`Size`]: struct.Size.html
-    /// [display points]: struct.Scale.html
-    pub fn window_size(mut self, size: impl Into<Size>) -> Self {
-        self.size = Some(size.into());
-        self
-    }
-
-    /// Set the window's minimum drawing area size in [display points].
-    ///
-    /// The actual minimum window size in pixels will depend on the platform DPI settings.
-    ///
-    /// This should be considered a request to the platform to set the minimum size of the window.
-    /// The platform might increase the size a tiny bit due to DPI.
-    ///
-    /// To set the window's initial drawing area size use [`window_size`].
-    ///
-    /// [`window_size`]: #method.window_size
-    /// [display points]: struct.Scale.html
-    pub fn with_min_size(mut self, size: impl Into<Size>) -> Self {
-        self.min_size = Some(size.into());
-        self
-    }
-
-    /// Set whether the window should be resizable.
-    pub fn resizable(mut self, resizable: bool) -> Self {
-        self.resizable = Some(resizable);
-        self
-    }
-
-    /// Set whether the window should have a titlebar and decorations.
-    pub fn show_titlebar(mut self, show_titlebar: bool) -> Self {
-        self.show_titlebar = Some(show_titlebar);
-        self
-    }
-
-    /// Sets the window position in virtual screen coordinates.
-    /// [`position`] Position in pixels.
-    ///
-    /// [`position`]: struct.Point.html
-    pub fn set_position(mut self, position: Point) -> Self {
-        self.position = Some(position);
-        self
-    }
-
-    /// Sets the [`WindowLevel`] of the window
-    ///
-    /// [`WindowLevel`]: enum.WindowLevel.html
-    pub fn set_level(mut self, level: WindowLevel) -> Self {
-        self.level = Some(level);
-        self
-    }
-
-    /// Sets the [`WindowState`] of the window.
-    ///
-    /// [`WindowState`]: enum.WindowState.html
-    pub fn set_window_state(mut self, state: WindowState) -> Self {
-        self.state = Some(state);
-        self
-    }
-
-    /// Set whether the window background should be transparent
-    pub fn transparent(mut self, transparent: bool) -> Self {
-        self.transparent = Some(transparent);
-        self
-    }
-
-    /// Apply this window configuration to the passed in WindowBuilder
-    pub fn apply_to_builder(&self, builder: &mut WindowBuilder) {
-        if let Some(resizable) = self.resizable {
-            builder.resizable(resizable);
-        }
-
-        if let Some(show_titlebar) = self.show_titlebar {
-            builder.show_titlebar(show_titlebar);
-        }
-
-        if let Some(size) = self.size {
-            builder.set_size(size);
-        } else if let WindowSizePolicy::Content = self.size_policy {
-            builder.set_size(Size::new(0., 0.));
-        }
-
-        if let Some(position) = self.position {
-            builder.set_position(position);
-        }
-
-        if let Some(transparent) = self.transparent {
-            builder.set_transparent(transparent);
-        }
-
-        if let Some(level) = self.level.clone() {
-            builder.set_level(level)
-        }
-
-        if let Some(state) = self.state {
-            builder.set_window_state(state);
-        }
-
-        if let Some(min_size) = self.min_size {
-            builder.set_min_size(min_size);
+        if let Some((menu, point)) = &mut self.context_menu {
+            if let Some(new_menu) = menu.update(Some(self.id), data, env) {
+                self.handle.show_context_menu(new_menu, *point);
+            }
         }
     }
 
-    /// Apply this window configuration to the passed in WindowHandle
-    pub fn apply_to_handle(&self, win_handle: &mut WindowHandle) {
-        if let Some(resizable) = self.resizable {
-            win_handle.resizable(resizable);
-        }
+    pub(crate) fn get_ime_handler(
+        &mut self,
+        req_token: TextFieldToken,
+        mutable: bool,
+    ) -> Box<dyn InputHandler> {
+        self.ime_handlers
+            .iter()
+            .find(|(token, _)| req_token == *token)
+            .and_then(|(_, reg)| reg.document.acquire(mutable))
+            .unwrap()
+    }
 
-        if let Some(show_titlebar) = self.show_titlebar {
-            win_handle.show_titlebar(show_titlebar);
+    fn update_focus(
+        &mut self,
+        widget_state: &mut WidgetState,
+        queue: &mut CommandQueue,
+        data: &T,
+        env: &Env,
+    ) {
+        if let Some(focus_req) = widget_state.request_focus.take() {
+            let old = self.focus;
+            let new = self.widget_for_focus_request(focus_req);
+            // Only send RouteFocusChanged in case there's actual change
+            if old != new {
+                let event = LifeCycle::Internal(InternalLifeCycle::RouteFocusChanged { old, new });
+                self.lifecycle(queue, &event, data, env, false);
+                self.focus = new;
+                // check if the newly focused widget has an IME session, and
+                // notify the system if so.
+                //
+                // If you're here because a profiler sent you: I guess I should've
+                // used a hashmap?
+                let old_was_ime = old
+                    .map(|old| {
+                        self.ime_handlers
+                            .iter()
+                            .any(|(_, sesh)| sesh.widget_id == old)
+                    })
+                    .unwrap_or(false);
+                let maybe_active_text_field = self
+                    .ime_handlers
+                    .iter()
+                    .find(|(_, sesh)| Some(sesh.widget_id) == self.focus)
+                    .map(|(token, _)| *token);
+                // we call this on every focus change; we could call it less but does it matter?
+                self.ime_focus_change = if maybe_active_text_field.is_some() {
+                    Some(maybe_active_text_field)
+                } else if old_was_ime {
+                    Some(None)
+                } else {
+                    None
+                };
+            }
         }
+    }
 
-        if let Some(size) = self.size {
-            win_handle.set_size(size);
+    /// Create a function that can invalidate the provided widget's text state.
+    ///
+    /// This will be called from outside the main app state in order to avoid
+    /// reentrancy problems.
+    pub(crate) fn ime_invalidation_fn(&self, widget: WidgetId) -> Option<Box<ImeUpdateFn>> {
+        let token = self
+            .ime_handlers
+            .iter()
+            .find(|(_, reg)| reg.widget_id == widget)
+            .map(|(t, _)| *t)?;
+        let window_handle = self.handle.clone();
+        Some(Box::new(move |event| {
+            window_handle.update_text_field(token, event)
+        }))
+    }
+
+    /// Release a lock on an IME session, returning a `WidgetId` if the lock was mutable.
+    ///
+    /// After a mutable lock is released, the widget needs to be notified so that
+    /// it can update any internal state.
+    pub(crate) fn release_ime_lock(&mut self, req_token: TextFieldToken) -> Option<WidgetId> {
+        self.ime_handlers
+            .iter()
+            .find(|(token, _)| req_token == *token)
+            .and_then(|(_, reg)| reg.document.release().then(|| reg.widget_id))
+    }
+
+    fn widget_for_focus_request(&self, focus: FocusChange) -> Option<WidgetId> {
+        match focus {
+            FocusChange::Resign => None,
+            FocusChange::Focus(id) => Some(id),
+            FocusChange::Next => self.widget_from_focus_chain(true),
+            FocusChange::Previous => self.widget_from_focus_chain(false),
         }
+    }
 
-        // Can't apply min size currently as window handle
-        // does not support it.
-
-        if let Some(position) = self.position {
-            win_handle.set_position(position);
-        }
-
-        if self.level.is_some() {
-            warn!("Applying a level can only be done on window builders");
-        }
-
-        if let Some(state) = self.state {
-            win_handle.set_window_state(state);
-        }
+    fn widget_from_focus_chain(&self, forward: bool) -> Option<WidgetId> {
+        self.focus.and_then(|focus| {
+            self.focus_chain()
+                .iter()
+                // Find where the focused widget is in the focus chain
+                .position(|id| id == &focus)
+                .map(|idx| {
+                    // Return the id that's next to it in the focus chain
+                    let len = self.focus_chain().len();
+                    let new_idx = if forward {
+                        (idx + 1) % len
+                    } else {
+                        (idx + len - 1) % len
+                    };
+                    self.focus_chain()[new_idx]
+                })
+                .or_else(|| {
+                    // If the currently focused widget isn't in the focus chain,
+                    // then we'll just return the first/last entry of the chain, if any.
+                    if forward {
+                        self.focus_chain().first().copied()
+                    } else {
+                        self.focus_chain().last().copied()
+                    }
+                })
+        })
     }
 }
 
-impl<T: Data> WindowDesc<T> {
-    /// Create a new `WindowDesc`, taking the root [`Widget`] for this window.
-    ///
-    /// [`Widget`]: trait.Widget.html
-    pub fn new<W>(root: W) -> WindowDesc<T>
-    where
-        W: Widget<T> + 'static,
-    {
-        WindowDesc {
-            pending: PendingWindow::new(root),
-            config: WindowConfig::default(),
-            id: WindowId::next(),
-        }
-    }
-
-    /// Set the title for this window. This is a [`LabelText`]; it can be either
-    /// a `String`, a [`LocalizedString`], or a closure that computes a string;
-    /// it will be kept up to date as the application's state changes.
-    ///
-    /// [`LabelText`]: widget/enum.LocalizedString.html
-    /// [`LocalizedString`]: struct.LocalizedString.html
-    pub fn title(mut self, title: impl Into<LabelText<T>>) -> Self {
-        self.pending = self.pending.title(title);
-        self
-    }
-
-    /// Set the menu for this window.
-    ///
-    /// `menu` is a callback for creating the menu. Its first argument is the id of the window that
-    /// will have the menu, or `None` if it's creating the root application menu for an app with no
-    /// menus (which can happen, for example, on macOS).
-    pub fn menu(
-        mut self,
-        menu: impl FnMut(Option<WindowId>, &T, &Env) -> Menu<T> + 'static,
-    ) -> Self {
-        self.pending = self.pending.menu(menu);
-        self
-    }
-
-    /// Set the window size policy
-    pub fn window_size_policy(mut self, size_policy: WindowSizePolicy) -> Self {
-        #[cfg(windows)]
-        {
-            // On Windows content_insets doesn't work on window with no initial size
-            // so the window size can't be adapted to the content, to fix this a
-            // non null initial size is set here.
-            if size_policy == WindowSizePolicy::Content {
-                self.config.size = Some(Size::new(1., 1.))
-            }
-        }
-        self.config.size_policy = size_policy;
-        self
-    }
-
-    /// Set the window's initial drawing area size in [display points].
-    ///
-    /// You can pass in a tuple `(width, height)` or a [`Size`],
-    /// e.g. to create a window with a drawing area 1000dp wide and 500dp high:
-    ///
-    /// ```ignore
-    /// window.window_size((1000.0, 500.0));
-    /// ```
-    ///
-    /// The actual window size in pixels will depend on the platform DPI settings.
-    ///
-    /// This should be considered a request to the platform to set the size of the window.
-    /// The platform might increase the size a tiny bit due to DPI.
-    ///
-    /// [`Size`]: struct.Size.html
-    /// [display points]: struct.Scale.html
-    pub fn window_size(mut self, size: impl Into<Size>) -> Self {
-        self.config.size = Some(size.into());
-        self
-    }
-
-    /// Set the window's minimum drawing area size in [display points].
-    ///
-    /// The actual minimum window size in pixels will depend on the platform DPI settings.
-    ///
-    /// This should be considered a request to the platform to set the minimum size of the window.
-    /// The platform might increase the size a tiny bit due to DPI.
-    ///
-    /// To set the window's initial drawing area size use [`window_size`].
-    ///
-    /// [`window_size`]: #method.window_size
-    /// [display points]: struct.Scale.html
-    pub fn with_min_size(mut self, size: impl Into<Size>) -> Self {
-        self.config = self.config.with_min_size(size);
-        self
-    }
-
-    /// Builder-style method to set whether this window can be resized.
-    pub fn resizable(mut self, resizable: bool) -> Self {
-        self.config = self.config.resizable(resizable);
-        self
-    }
-
-    /// Builder-style method to set whether this window's titlebar is visible.
-    pub fn show_titlebar(mut self, show_titlebar: bool) -> Self {
-        self.config = self.config.show_titlebar(show_titlebar);
-        self
-    }
-
-    /// Builder-style method to set whether this window's background should be
-    /// transparent.
-    pub fn transparent(mut self, transparent: bool) -> Self {
-        self.config = self.config.transparent(transparent);
-        self.pending = self.pending.transparent(transparent);
-        self
-    }
-
-    /// Sets the initial window position in [display points], relative to the origin
-    /// of the [virtual screen].
-    ///
-    /// [display points]: crate::Scale
-    /// [virtual screen]: crate::Screen
-    pub fn set_position(mut self, position: impl Into<Point>) -> Self {
-        self.config = self.config.set_position(position.into());
-        self
-    }
-
-    /// Sets the [`WindowLevel`] of the window
-    ///
-    /// [`WindowLevel`]: enum.WindowLevel.html
-    pub fn set_level(mut self, level: WindowLevel) -> Self {
-        self.config = self.config.set_level(level);
-        self
-    }
-
-    /// Set initial state for the window.
-    pub fn set_window_state(mut self, state: WindowState) -> Self {
-        self.config = self.config.set_window_state(state);
-        self
-    }
-
-    /// Set the [`WindowConfig`] of window.
-    pub fn with_config(mut self, config: WindowConfig) -> Self {
-        self.config = config;
-        self
-    }
-
-    /// Attempt to create a platform window from this `WindowDesc`.
-    pub(crate) fn build_native(
-        self,
-        state: &mut AppState<T>,
-    ) -> Result<WindowHandle, PlatformError> {
-        state.build_native_window(self.id, self.pending, self.config)
+impl WindowId {
+    /// Allocate a new, unique window id.
+    pub fn next() -> WindowId {
+        static WINDOW_COUNTER: Counter = Counter::new();
+        WindowId(WINDOW_COUNTER.next())
     }
 }
